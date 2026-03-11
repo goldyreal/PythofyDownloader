@@ -41,8 +41,7 @@ VIAddVersionKey "LegalCopyright"  "© 2025 ${PUBLISHER}"
 ; ============================================================
 Section "Install"
     SetOutPath "$INSTDIR"
-    File "dist\youtube_downloader_gui.exe"
-    Rename "$INSTDIR\youtube_downloader_gui.exe" "$INSTDIR\${APP_EXE}"
+    File "dist\Pythofy.exe"
 
     ; Copia yt-dlp e ffmpeg dal bundle — nessun download, nessun PowerShell
     SetOutPath "$INSTDIR\pythofy_tools"
