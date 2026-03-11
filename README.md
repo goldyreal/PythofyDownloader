@@ -1,6 +1,6 @@
 # Pythofy Downloader
 
-Download .mp3 songs with metadata from a Spotify playlist of a max of 100 songs.
+Download .mp3 songs with metadata from a Spotify playlist.
 
 ## Installation
 Download the latest installer from [Releases](link) and run it.
