@@ -13,7 +13,7 @@ Download the latest installer from [Releases](link) and run it.
 - NSIS 3.x to create the setup
 
 ### Steps
-1. Build the exe: `pyinstaller --onefile --noconsole youtube_downloader_gui.py`
+1. Build the exe: `pyinstaller --onefile --noconsole Pythofy.py`
 2. Download `yt-dlp.exe` and place it in `dist/pythofy_tools/`
 3. Download `ffmpeg.exe` and place it in `dist/pythofy_tools/`
 4. Compile the setup with NSIS: right click `PythofySetup.nsi` → Compile
