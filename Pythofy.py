@@ -24,18 +24,22 @@ import json
 def _find_cmd(name: str) -> list:
     import shutil, os, sys
     frozen = getattr(sys, "frozen", False)
-    exe = shutil.which(name) or shutil.which(name + ".exe")
-    if exe:
-        return [exe]
+    # pythofy_tools ha priorità: usa sempre la versione bundled se disponibile
     base_path = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
     local_tool = os.path.join(base_path, "pythofy_tools", name + ".exe")
     if os.path.exists(local_tool):
         return [local_tool]
+    exe = shutil.which(name) or shutil.which(name + ".exe")
+    if exe:
+        return [exe]
     if not frozen:
         module = name.replace("-", "_")
         return [sys.executable, "-m", module]
     return [name]
 
+
+# Flag per nascondere finestre console su Windows
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -64,7 +68,7 @@ SANS      = "Arial"
 class YouTubeDownloaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Pythofy v1.2.0")
+        self.title("Pythofy v1.2.2")
         self.configure(bg=BG)
         self.resizable(True, True)
         self.minsize(1080, 580)
@@ -465,14 +469,20 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
 
     def _check_ytdlp(self):
         try:
-            subprocess.run(_find_cmd("yt-dlp") + ["--version"], capture_output=True, timeout=8)
+            subprocess.run(
+                _find_cmd("yt-dlp") + ["--version"],
+                capture_output=True, timeout=8, creationflags=_NO_WINDOW,
+            )
             return True
         except Exception:
             return False
 
     def _which(self, cmd):
         try:
-            subprocess.run([cmd, "--version"], capture_output=True, timeout=8)
+            subprocess.run(
+                _find_cmd(cmd) + ["--version"],
+                capture_output=True, timeout=8, creationflags=_NO_WINDOW,
+            )
             return True
         except Exception:
             return False
@@ -1111,7 +1121,10 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 "--no-warnings",
                 "--quiet",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace", creationflags=_NO_WINDOW,
+            )
             if result.returncode == 0:
                 title = result.stdout.strip().split('\n')[0]
                 return title if title else None
@@ -1130,7 +1143,10 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 "--no-warnings",
                 "--quiet",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace", creationflags=_NO_WINDOW,
+            )
             if result.returncode == 0:
                 title = result.stdout.strip().split('\n')[0]
                 return title if title else None
@@ -1151,18 +1167,25 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 "--no-warnings",
                 "--quiet",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
-            
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                urls = [line.strip() for line in lines if line.strip() and ("youtube.com" in line or "youtu.be" in line)]
-                
-                if urls:
-                    self.after(0, lambda: self._log_write("   Found videos", "ok"))
-                    return urls
-            
-            self.after(0, lambda: self._log_write("   ⚠ No videos found", "warn"))
-            return None
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace", creationflags=_NO_WINDOW,
+            )
+
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "")[:120].strip()
+                self.after(0, lambda e=err: self._log_write(f"   ⚠ yt-dlp error: {e}", "warn"))
+                return None
+
+            lines = result.stdout.strip().split('\n')
+            urls = [line.strip() for line in lines if line.strip() and ("youtube.com" in line or "youtu.be" in line)]
+
+            if not urls:
+                self.after(0, lambda: self._log_write("   ⚠ No videos found in playlist", "warn"))
+                return None
+
+            self.after(0, lambda n=len(urls): self._log_write(f"   Found {n} videos", "ok"))
+            return urls
             
         except Exception as e:
             self.after(0, lambda: self._log_write(f"   ⚠ Error: could not extract playlist", "warn"))

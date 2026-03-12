@@ -7,6 +7,7 @@ Unicode True
 !include "MUI2.nsh"
 !include "WinMessages.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 !define APP_NAME    "Pythofy Downloader"
 !define APP_EXE     "Pythofy.exe"
@@ -14,7 +15,14 @@ Unicode True
 !define PUBLISHER   "Pythofy"
 !define UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pythofy"
 !define INSTALLER_NAME "PythofySetup"
-SilentInstall silent
+; Silent solo se lanciato con /S, altrimenti wizard normale
+Function .onInit
+    ${GetOptions} $CMDLINE "/S" $R0
+    IfErrors 0 +2
+        Return
+    SetSilent silent
+FunctionEnd
+
 
 Name            "${APP_NAME}"
 OutFile         "PythofySetup.exe"
@@ -73,7 +81,6 @@ Section "Install"
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-    MessageBox MB_OK "Installazione completata!"
 SectionEnd
 
 ; ============================================================
