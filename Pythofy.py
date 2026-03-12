@@ -64,11 +64,14 @@ BORDER    = "#222222"   # default border
 MONO      = "Arial"
 SANS      = "Arial"
 
+APP_VERSION  = "1.3.0"
+GITHUB_REPO  = "goldyreal/PythofyDownloader"
+
 
 class YouTubeDownloaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Pythofy v1.2.2")
+        self.title(f"Pythofy v{APP_VERSION}")
         self.configure(bg=BG)
         self.resizable(True, True)
         self.minsize(1080, 580)
@@ -90,6 +93,8 @@ class YouTubeDownloaderApp(tk.Tk):
         self._setup_styles()
         self._build_ui()
         self._check_deps_async()
+        self.after(1500, self._check_updates_async)
+        self.after(200, self._check_rollback_available)
 
     def _setup_styles(self):
         style = ttk.Style(self)
@@ -279,6 +284,9 @@ class YouTubeDownloaderApp(tk.Tk):
         clr = tk.Label(hdr, text="CLEAR", font=(MONO, 8), bg=BG2, fg=TEXT_DIM, cursor="hand2")
         clr.pack(side="right", padx=14)
         clr.bind("<Button-1>", lambda e: self._clear_log())
+        # Rollback button — visibile solo se esiste il .old
+        self._rollback_lbl = tk.Label(hdr, text="↩ ROLLBACK", font=(MONO, 8), bg=BG2, fg=WARN_CLR, cursor="hand2")
+        self._rollback_lbl.bind("<Button-1>", lambda e: self._confirm_rollback())
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", side="top")
 
         log_frame = tk.Frame(parent, bg=BG3)
@@ -1502,6 +1510,276 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self._log_write("Download stopped", "warn")
             self._set_status("Stopped", WARN_CLR)
         self._on_done()
+
+    # ══════════════════════════════════════════
+    #  AUTO-UPDATE
+    # ══════════════════════════════════════════
+
+    def _check_updates_async(self):
+        threading.Thread(target=self._check_updates, daemon=True).start()
+
+    def _check_updates(self):
+        self.after(0, lambda: self._log_write("Checking for updates…", "dim"))
+        try:
+            import urllib.request, json as _json, ssl
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "Pythofy-Updater"})
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                data = _json.loads(resp.read().decode())
+
+            latest_tag = data.get("tag_name", "").lstrip("v")
+            if not latest_tag:
+                self.after(0, lambda: self._log_write("⚠ Could not read latest version", "warn"))
+                return
+
+            def _ver(s):
+                try:
+                    return tuple(int(x) for x in s.split("."))
+                except Exception:
+                    return (0,)
+
+            if _ver(latest_tag) <= _ver(APP_VERSION):
+                self.after(0, lambda: self._log_write("✓ Pythofy is up to date!", "ok"))
+                return
+
+            assets = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+            self.after(0, lambda v=latest_tag, a=assets: self._show_update_dialog(v, a))
+
+        except Exception as e:
+            self.after(0, lambda e=e: self._log_write(f"⚠ Update check failed: {str(e)[:60]}", "warn"))
+
+    def _show_update_dialog(self, new_version, assets):
+        self._log_write(f"🆕 Update available: v{new_version}", "ok")
+
+        win = tk.Toplevel(self)
+        win.title("Update Available")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.grab_set()
+
+        # Centra la finestra
+        win.update_idletasks()
+        w, h = 420, 220
+        x = self.winfo_x() + (self.winfo_width()  - w) // 2
+        y = self.winfo_y() + (self.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Header
+        hdr = tk.Frame(win, bg=ACCENT, height=4)
+        hdr.pack(fill="x")
+
+        body = tk.Frame(win, bg=BG, padx=32, pady=24)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="Update available",
+                 font=(MONO, 13, "bold"), bg=BG, fg=TEXT).pack(anchor="w")
+        tk.Label(body, text=f"v{APP_VERSION}  →  v{new_version}",
+                 font=(SANS, 10), bg=BG, fg=TEXT_MID).pack(anchor="w", pady=(6, 0))
+        tk.Label(body, text="Pythofy.exe, yt-dlp.exe and ffmpeg.exe will be updated.",
+                 font=(SANS, 9), bg=BG, fg=TEXT_SUB).pack(anchor="w", pady=(4, 0))
+
+        self._update_progress_var = tk.StringVar(value="")
+        prog_lbl = tk.Label(body, textvariable=self._update_progress_var,
+                            font=(MONO, 8), bg=BG, fg=ACCENT)
+        prog_lbl.pack(anchor="w", pady=(10, 0))
+
+        btn_row = tk.Frame(body, bg=BG)
+        btn_row.pack(anchor="w", pady=(14, 0))
+
+        update_btn = self._primary_btn(btn_row, "UPDATE NOW", lambda: None)
+        update_btn.pack(side="left")
+        skip_btn = self._ghost_btn(btn_row, "SKIP", win.destroy)
+        skip_btn.pack(side="left", padx=(10, 0))
+
+        def do_update():
+            update_btn.config(state="disabled")
+            skip_btn.config(state="disabled")
+            threading.Thread(
+                target=self._do_update,
+                args=(assets, win),
+                daemon=True
+            ).start()
+
+        update_btn.config(command=do_update)
+
+    def _do_update(self, assets, win):
+        import urllib.request, ssl, os, sys, tempfile, shutil, zipfile
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        frozen = getattr(sys, "frozen", False)
+        base_path = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
+        tools_path = os.path.join(base_path, "pythofy_tools")
+
+        # Asset da scaricare: "Pythofy - Portable.zip"
+        ASSET_NAME = "Pythofy.-.Portable.zip"
+        url = assets.get(ASSET_NAME)
+        if not url:
+            self.after(0, lambda: self._update_progress_var.set(
+                f"❌ Asset \"{ASSET_NAME}\" not found in release"))
+            return
+
+        tmp_dir = tempfile.mkdtemp(prefix="pythofy_update_")
+        zip_path = os.path.join(tmp_dir, "update.zip")
+
+        try:
+            # ── Scarica lo zip ──────────────────────────────────────
+            self.after(0, lambda: self._update_progress_var.set("Downloading update…"))
+            req = urllib.request.Request(url, headers={"User-Agent": "Pythofy-Updater"})
+            with urllib.request.urlopen(req, timeout=180, context=ctx) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded_bytes = 0
+                chunk = 65536
+                with open(zip_path, "wb") as f:
+                    while True:
+                        buf = resp.read(chunk)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        downloaded_bytes += len(buf)
+                        if total:
+                            pct = int(downloaded_bytes / total * 100)
+                            self.after(0, lambda p=pct:
+                                self._update_progress_var.set(f"Downloading… {p}%"))
+
+            # ── Estrai lo zip ───────────────────────────────────────
+            self.after(0, lambda: self._update_progress_var.set("Extracting…"))
+            extract_dir = os.path.join(tmp_dir, "extracted")
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(extract_dir)
+
+            # Lo zip può avere una cartella radice (es. "Pythofy - Portable/")
+            # Trova la root che contiene Pythofy.exe
+            root = extract_dir
+            for entry in os.listdir(extract_dir):
+                candidate = os.path.join(extract_dir, entry)
+                if os.path.isdir(candidate) and os.path.exists(
+                        os.path.join(candidate, "Pythofy.exe")):
+                    root = candidate
+                    break
+
+            # ── Copia i file ────────────────────────────────────────
+            # pythofy_tools: yt-dlp.exe e ffmpeg.exe
+            src_tools = os.path.join(root, "pythofy_tools")
+            os.makedirs(tools_path, exist_ok=True)
+            for tool in ("yt-dlp.exe", "ffmpeg.exe"):
+                src = os.path.join(src_tools, tool)
+                if os.path.exists(src):
+                    self.after(0, lambda t=tool: self._update_progress_var.set(
+                        f"Installing {t}…"))
+                    shutil.copy2(src, os.path.join(tools_path, tool))
+
+            # Pythofy.exe — non puoi sovrascrivere l'exe in esecuzione su Windows:
+            # rinomina il vecchio in .old, poi copia il nuovo
+            new_exe_src = os.path.join(root, "Pythofy.exe")
+            new_exe_dst = os.path.join(base_path, "Pythofy.exe")
+            if os.path.exists(new_exe_src):
+                self.after(0, lambda: self._update_progress_var.set("Installing Pythofy.exe…"))
+                if frozen:
+                    old_path = new_exe_dst + ".old"
+                    try:
+                        os.replace(new_exe_dst, old_path)
+                    except Exception:
+                        pass
+                shutil.copy2(new_exe_src, new_exe_dst)
+
+            self.after(0, lambda: self._update_progress_var.set("✓ Update complete — restarting…"))
+            self.after(0, lambda: win.after(1200, lambda: self._restart_app(new_exe_dst if frozen else None)))
+
+        except Exception as e:
+            err = str(e)[:80]
+            self.after(0, lambda e=err: self._update_progress_var.set(f"❌ Error: {e}"))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _restart_app(self, exe_path=None):
+        import subprocess, sys, os
+        target = exe_path or sys.executable
+        # Cleanup .old dopo il riavvio (best-effort, lo elimina il nuovo processo)
+        subprocess.Popen(
+            [target],
+            creationflags=_NO_WINDOW,
+            close_fds=True,
+        )
+        self.destroy()
+        sys.exit(0)
+
+
+    # ══════════════════════════════════════════
+    #  ROLLBACK
+    # ══════════════════════════════════════════
+
+    def _old_exe_path(self):
+        import sys, os
+        frozen = getattr(sys, "frozen", False)
+        base = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
+        return os.path.join(base, "Pythofy.exe.old")
+
+    def _check_rollback_available(self):
+        if os.path.exists(self._old_exe_path()):
+            self._rollback_lbl.pack(side="right", padx=(0, 8))
+        else:
+            self._rollback_lbl.pack_forget()
+
+    def _confirm_rollback(self):
+        if not os.path.exists(self._old_exe_path()):
+            self._log_write("⚠ No previous version found", "warn")
+            return
+        win = tk.Toplevel(self)
+        win.title("Rollback")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.grab_set()
+        win.update_idletasks()
+        w, h = 380, 160
+        x = self.winfo_x() + (self.winfo_width()  - w) // 2
+        y = self.winfo_y() + (self.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        tk.Frame(win, bg=WARN_CLR, height=4).pack(fill="x")
+        body = tk.Frame(win, bg=BG, padx=28, pady=20)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="Restore previous version?",
+                 font=(MONO, 11, "bold"), bg=BG, fg=TEXT).pack(anchor="w")
+        tk.Label(body, text="The current version will be removed. The app will restart.",
+                 font=(SANS, 9), bg=BG, fg=TEXT_SUB).pack(anchor="w", pady=(6, 14))
+
+        btn_row = tk.Frame(body, bg=BG)
+        btn_row.pack(anchor="w")
+        self._ghost_btn(btn_row, "RESTORE", lambda: [win.destroy(), self._do_rollback()]).pack(side="left")
+        self._ghost_btn(btn_row, "CANCEL",  win.destroy).pack(side="left", padx=(10, 0))
+
+    def _do_rollback(self):
+        import sys, shutil
+        frozen = getattr(sys, "frozen", False)
+        old_path = self._old_exe_path()
+        if not os.path.exists(old_path):
+            self._log_write("❌ Previous version file not found", "err")
+            return
+        base = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
+        current = os.path.join(base, "Pythofy.exe")
+        broken  = current + ".broken"
+        try:
+            # Sposta il corrente in .broken, rimetti il .old al suo posto
+            if frozen:
+                try:
+                    os.replace(current, broken)
+                except Exception:
+                    pass
+            shutil.copy2(old_path, current)
+            os.remove(old_path)
+            self._log_write("↩ Rollback complete — restarting…", "ok")
+            self.after(1200, lambda: self._restart_app(current if frozen else None))
+        except Exception as e:
+            self._log_write(f"❌ Rollback failed: {str(e)[:60]}", "err")
+
 
     def _on_done(self):
         self._progress.stop()
