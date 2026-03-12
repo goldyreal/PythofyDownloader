@@ -3,6 +3,7 @@
 ; ============================================================
 
 Unicode True
+
 !include "MUI2.nsh"
 !include "WinMessages.nsh"
 !include "LogicLib.nsh"
@@ -12,6 +13,8 @@ Unicode True
 !define APP_VERSION "1.0.0"
 !define PUBLISHER   "Pythofy"
 !define UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\Pythofy"
+!define INSTALLER_NAME "PythofySetup"
+SilentInstall silent
 
 Name            "${APP_NAME}"
 OutFile         "PythofySetup.exe"
