@@ -64,9 +64,36 @@ BORDER    = "#222222"   # default border
 MONO      = "Arial"
 SANS      = "Arial"
 
-APP_VERSION  = "1.3.0"
+APP_VERSION  = "1.4.0"
 GITHUB_REPO  = "goldyreal/PythofyDownloader"
 
+
+
+def _config_path():
+    import sys, os
+    frozen = getattr(sys, "frozen", False)
+    base = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
+    return os.path.join(base, ".pythofy_config.json")
+
+def _load_config():
+    try:
+        p = _config_path()
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_config(data):
+    try:
+        p = _config_path()
+        existing = _load_config()
+        existing.update(data)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 class YouTubeDownloaderApp(tk.Tk):
     def __init__(self):
@@ -182,7 +209,7 @@ class YouTubeDownloaderApp(tk.Tk):
         pad = dict(padx=28)
 
         # SOURCE
-        self._section_label(inner, "SPOTIFY OR YOUTUBE URL (Playlist / Single Song)").pack(anchor="w", pady=(28, 10), **pad)
+        self._section_label(inner, "SPOTIFY, YOUTUBE OR SOUNDCLOUD URL").pack(anchor="w", pady=(28, 10), **pad)
         url_wrap = tk.Frame(inner, bg=BG)
         url_wrap.pack(fill="x", **pad)
         url_wrap.columnconfigure(0, weight=1)
@@ -195,8 +222,9 @@ class YouTubeDownloaderApp(tk.Tk):
         dir_wrap = tk.Frame(inner, bg=BG)
         dir_wrap.pack(fill="x", **pad)
         dir_wrap.columnconfigure(0, weight=1)
+        _cfg = _load_config()
         self._dir_var = tk.StringVar(
-            value=os.path.join(os.path.expanduser("~"), "Downloads", "Pythofy"))
+            value=_cfg.get("last_dest", os.path.join(os.path.expanduser("~"), "Downloads", "Pythofy")))
         self._entry(dir_wrap, self._dir_var).grid(row=0, column=0, sticky="ew", ipady=10)
         self._ghost_btn(dir_wrap, "BROWSE", self._browse_dir).grid(row=0, column=1, padx=(8, 0))
 
@@ -213,6 +241,15 @@ class YouTubeDownloaderApp(tk.Tk):
                      values=["128", "192", "256", "320"],
                      state="readonly", style="app.TCombobox",
                      font=(SANS, 10), width=7).pack(anchor="w")
+
+        fmt_frame = tk.Frame(opts, bg=BG)
+        fmt_frame.pack(side="left", padx=(0, 32))
+        self._micro_label(fmt_frame, "FORMAT").pack(anchor="w", pady=(0, 6))
+        self._fmt_var = tk.StringVar(value="mp3")
+        ttk.Combobox(fmt_frame, textvariable=self._fmt_var,
+                     values=["mp3", "flac", "m4a", "ogg", "wav"],
+                     state="readonly", style="app.TCombobox",
+                     font=(SANS, 10), width=6).pack(anchor="w")
 
         n_frame = tk.Frame(opts, bg=BG)
         n_frame.pack(side="left")
@@ -251,6 +288,7 @@ class YouTubeDownloaderApp(tk.Tk):
         csv_e.grid(row=0, column=0, sticky="ew", ipady=10)
         csv_e.config(state="readonly", readonlybackground=BG3)
         self._ghost_btn(csv_row, "IMPORT CSV", self._import_csv).grid(row=0, column=1, padx=(8, 0))
+        self._ghost_btn(csv_row, "CLEAR", self._clear_csv).grid(row=0, column=2, padx=(6, 0))
 
         # DIVIDER
         tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(28, 0))
@@ -275,6 +313,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self._stop_btn.config(state="disabled")
         self._open_btn = self._ghost_btn(btn_area, "OPEN FOLDER", self._open_folder)
         self._open_btn.pack(side="left", padx=(10, 0))
+        self._ghost_btn(btn_area, "SONGS", self._open_songs_window).pack(side="left", padx=(10, 0))
 
     def _build_console(self, parent):
         hdr = tk.Frame(parent, bg=BG2, height=36)
@@ -304,6 +343,34 @@ class YouTubeDownloaderApp(tk.Tk):
         self._log.tag_config("warn", foreground=WARN_CLR)
         self._log.tag_config("dim",  foreground=TEXT_DIM)
         self._log.tag_config("bold", foreground=TEXT, font=(MONO, 8, "bold"))
+
+        # ── Queue panel ────────────────────────────
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", side="top")
+        queue_hdr = tk.Frame(parent, bg=BG2, height=30)
+        queue_hdr.pack(fill="x", side="top")
+        queue_hdr.pack_propagate(False)
+        tk.Label(queue_hdr, text="QUEUE", font=(MONO, 8, "bold"), bg=BG2, fg=TEXT_DIM).pack(side="left", padx=14)
+        self._queue_count_lbl = tk.Label(queue_hdr, text="", font=(MONO, 8), bg=BG2, fg=TEXT_SUB)
+        self._queue_count_lbl.pack(side="left")
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", side="top")
+
+        queue_frame = tk.Frame(parent, bg=BG3, height=160)
+        queue_frame.pack(fill="x", side="top")
+        queue_frame.pack_propagate(False)
+
+        self._queue_list = tk.Text(queue_frame, font=(MONO, 8), bg=BG3, fg=TEXT_MID,
+                                    relief="flat", bd=8, state="disabled", wrap="none",
+                                    selectbackground=BG4, selectforeground=TEXT,
+                                    height=8)
+        q_scroll = ttk.Scrollbar(queue_frame, orient="vertical", command=self._queue_list.yview)
+        self._queue_list.configure(yscrollcommand=q_scroll.set)
+        q_scroll.pack(side="right", fill="y")
+        self._queue_list.pack(side="left", fill="both", expand=True)
+        self._queue_list.tag_config("queued",      foreground=TEXT_SUB)
+        self._queue_list.tag_config("downloading", foreground=WARN_CLR)
+        self._queue_list.tag_config("done",        foreground=OK_CLR)
+        self._queue_list.tag_config("error",       foreground=ERROR_CLR)
+        self._queue_list.tag_config("skipped",     foreground=TEXT_DIM)
 
     def _build_statusbar(self):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", side="bottom")
@@ -539,13 +606,14 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             return
         
         # URL validation
-        is_spotify = url and "spotify.com" in url
-        is_youtube = url and ("youtube.com" in url or "youtu.be" in url)
-        
-        if url and not is_spotify and not is_youtube:
-            messagebox.showwarning("Invalid URL", "Use a Spotify or YouTube URL.")
+        is_spotify    = url and "spotify.com" in url
+        is_youtube    = url and ("youtube.com" in url or "youtu.be" in url)
+        is_soundcloud = url and "soundcloud.com" in url
+
+        if url and not is_spotify and not is_youtube and not is_soundcloud:
+            messagebox.showwarning("Invalid URL", "Use a Spotify, YouTube or SoundCloud URL.")
             return
-        
+
         if url and is_spotify:
             if not ("playlist" in url or "track" in url):
                 messagebox.showwarning("Invalid Spotify URL", "Use a Spotify track or playlist link.")
@@ -556,6 +624,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             return
 
         os.makedirs(out, exist_ok=True)
+        _save_config({"last_dest": out})
 
         self._running = True
         self._dl_btn.config(state="disabled")
@@ -565,23 +634,31 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         if url:
             if is_youtube:
                 self._log_write(f"URL YouTube: {url}", "bold")
+            elif is_soundcloud:
+                self._log_write(f"URL SoundCloud: {url}", "bold")
             else:
                 self._log_write(f"URL Spotify: {url}", "bold")
         self._log_write(f"Destination: {out}", "dim")
 
         threading.Thread(target=self._extract_and_download,
-                         args=(url, out, self._qual_var.get(), csv_songs),
+                         args=(url, out, self._qual_var.get(), csv_songs, self._fmt_var.get()),
                          daemon=True).start()
 
-    def _extract_and_download(self, spotify_url, out, quality, csv_songs=None):
-        """Extract songs from Spotify/YouTube and download them"""
+    def _extract_and_download(self, spotify_url, out, quality, csv_songs=None, fmt="mp3"):
+        """Extract songs from Spotify/YouTube/SoundCloud and download them"""
         try:
             # Determina il tipo di URL e source
-            is_youtube = self._is_youtube_url(spotify_url) if spotify_url else False
-            source = "youtube" if is_youtube else "spotify"
+            is_youtube    = self._is_youtube_url(spotify_url) if spotify_url else False
+            is_soundcloud = self._is_soundcloud_url(spotify_url) if spotify_url else False
+            if is_youtube:
+                source = "youtube"
+            elif is_soundcloud:
+                source = "soundcloud"
+            else:
+                source = "spotify"
             is_playlist = False
             playlist_name = None
-            
+
             if csv_songs:
                 self.after(0, lambda n=len(csv_songs): self._log_write(
                     f"Using CSV list: {n} songs", "ok"))
@@ -593,18 +670,29 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             elif is_youtube:
                 # Gestisci download da YouTube
                 self.after(0, lambda: self._log_write("YouTube URL detected", "dim"))
-                
+
                 if self._is_youtube_playlist_url(spotify_url):
-                    # È una playlist YouTube
                     is_playlist = True
                     self.after(0, lambda: self._log_write("   Playlist found", "dim"))
                     playlist_name = self._get_youtube_playlist_name(spotify_url)
                     songs = self._extract_youtube_playlist_songs(spotify_url)
                 else:
-                    # È un video YouTube singolo
                     is_playlist = False
                     self.after(0, lambda: self._log_write("   Single video", "dim"))
-                    songs = [spotify_url]  # Usa l'URL diretto
+                    songs = [spotify_url]
+
+            elif is_soundcloud:
+                # SoundCloud — yt-dlp gestisce tutto nativamente
+                self.after(0, lambda: self._log_write("SoundCloud URL detected", "dim"))
+                is_playlist = "/sets/" in spotify_url
+                if is_playlist:
+                    self.after(0, lambda: self._log_write("   Playlist found", "dim"))
+                    playlist_name = self._get_soundcloud_playlist_name(spotify_url)
+                    songs = self._extract_soundcloud_playlist_songs(spotify_url)
+                else:
+                    self.after(0, lambda: self._log_write("   Single track", "dim"))
+                    songs = [spotify_url]
+
             else:
                 # Gestisci download da Spotify
                 # Check if it is a single track or a playlist
@@ -655,6 +743,10 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             # Load universal tracking file from base Pythofy folder
             done_file = self._done_file_path(self._dir_var.get())
             already_done = self._load_done(done_file, out)
+            already_done = self._sync_done_with_disk(already_done, out)
+            # Salva subito il json ripulito
+            if already_done is not None:
+                self._save_done(done_file, already_done, out)
 
             if already_done:
                 skipped = sum(1 for s in songs if s in already_done)
@@ -667,8 +759,10 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self._already_done = already_done
             self._done_key = out
             self._current_song_idx = 0
-            self._is_youtube_mode = is_youtube  # Traccia se siamo in modalità YouTube
-            self._download_next_song(out, quality)
+            self._is_youtube_mode = is_youtube
+            self._is_soundcloud_mode = is_soundcloud
+            self.after(0, lambda s=songs: self._queue_build(s))
+            self._download_next_song(out, quality, fmt)
 
         except Exception as e:
             self.after(0, lambda: self._log_write(f"❌ Error: {e}", "err"))
@@ -689,6 +783,45 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             pass
         return set()
     
+    def _sync_done_with_disk(self, already_done, folder):
+        """Rimuove dal set le canzoni il cui file audio non esiste più su disco.
+        Strategia: per ogni canzone nel JSON, cerca un file audio nella cartella
+        il cui stem contiene almeno una parola significativa del nome canzone.
+        Se la cartella è vuota o non esiste, pulisce tutto il set."""
+        if not already_done or not os.path.exists(folder):
+            return already_done
+        try:
+            audio_exts = {".mp3", ".flac", ".m4a", ".ogg", ".wav", ".opus"}
+            audio_stems = set()
+            for fname in os.listdir(folder):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in audio_exts:
+                    audio_stems.add(os.path.splitext(fname)[0].lower())
+
+            # Se non c'è nessun file audio nella cartella, svuota tutto
+            if not audio_stems:
+                return set()
+
+            # Per ogni canzone nel JSON, controlla se esiste almeno un file
+            # audio il cui stem condivide 2+ parole con il nome canzone
+            removed = set()
+            for song in list(already_done):
+                words = set(w for w in re.split(r"[\s\-_,]", song.lower()) if len(w) > 2)
+                if not words:
+                    continue
+                found = any(
+                    sum(1 for w in words if w in stem) >= min(2, len(words))
+                    for stem in audio_stems
+                )
+                if not found:
+                    removed.add(song)
+
+            if removed:
+                already_done -= removed
+            return already_done
+        except Exception:
+            return already_done
+
     def _save_done(self, done_file, already_done, playlist_key):
         try:
             data = {}
@@ -1199,9 +1332,8 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self.after(0, lambda: self._log_write(f"   ⚠ Error: could not extract playlist", "warn"))
             return None
 
-    def _download_next_song(self, out, quality):
+    def _download_next_song(self, out, quality, fmt="mp3"):
         """Download the next song in the list, skipping already downloaded ones"""
-        # Advance to next undownloaded song
         while self._current_song_idx < len(self._songs_list):
             song = self._songs_list[self._current_song_idx]
             if song in self._already_done:
@@ -1209,6 +1341,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 n = self._current_song_idx
                 self.after(0, lambda n=n, s=song: self._log_write(
                     f"[{n}/{len(self._songs_list)}] Already downloaded", "dim"))
+                self.after(0, lambda s=song: self._queue_set_status(s, "skipped"))
             else:
                 break
 
@@ -1218,6 +1351,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 self.after(0, lambda: self._log_write(
                     f"✓ Complete! ({total} songs)", "ok"))
                 self.after(0, lambda: self._set_status("Complete", ACCENT))
+                self._notify_complete(total)
             self._running = False
             self.after(0, self._on_done)
             return
@@ -1226,9 +1360,9 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         self._current_song_idx += 1
         idx = self._current_song_idx
 
-        # Get title for display
         display_title = song
         is_youtube_mode = getattr(self, "_is_youtube_mode", False)
+        is_soundcloud_mode = getattr(self, "_is_soundcloud_mode", False)
         if is_youtube_mode and ("youtube.com" in song or "youtu.be" in song):
             title = self._get_youtube_video_title(song)
             if title:
@@ -1236,9 +1370,12 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
 
         self.after(0, lambda: self._log_write(
             f"[{idx}/{len(self._songs_list)}] - {display_title}", "bold"))
-        
-        # Determine if searching YouTube or using direct URL
+        self.after(0, lambda s=song: self._queue_set_status(s, "downloading"))
+
         if is_youtube_mode and ("youtube.com" in song or "youtu.be" in song):
+            self.after(0, lambda t=display_title: self._track_lbl.config(
+                text=f"⏳ [{idx}/{len(self._songs_list)}] {t}  -  downloading"))
+        elif is_soundcloud_mode:
             self.after(0, lambda t=display_title: self._track_lbl.config(
                 text=f"⏳ [{idx}/{len(self._songs_list)}] {t}  -  downloading"))
         else:
@@ -1250,30 +1387,28 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 self._already_done.add(song)
                 self._save_done(self._done_file, self._already_done, self._done_key)
                 self.after(0, lambda: self._log_write(f"   ✓ Done", "ok"))
-                self._retry_count.pop(song, None)  # Resetta contatore retry
-                self._download_next_song(out, quality)
+                self.after(0, lambda s=song: self._queue_set_status(s, "done"))
+                self._retry_count.pop(song, None)
+                self._download_next_song(out, quality, fmt)
             else:
-                # Gestisci il retry
                 current_retry = self._retry_count.get(song, 0)
                 if current_retry < self._max_retries:
                     self._retry_count[song] = current_retry + 1
                     self.after(0, lambda c=current_retry+1, m=self._max_retries:
                         self._log_write(f"   Retry ({c}/{m})...", "warn"))
-                    # Riprova in un thread separato per non bloccare l'UI
                     def retry_download():
                         import time
-                        time.sleep(1)  # Wait 1 second before retrying
+                        time.sleep(1)
                         if self._running:
-                            self._download_song_youtube(song, out, quality, on_complete)
-                    
-                    retry_thread = threading.Thread(target=retry_download, daemon=True)
-                    retry_thread.start()
+                            self._download_song_youtube(song, out, quality, on_complete, fmt)
+                    threading.Thread(target=retry_download, daemon=True).start()
                 else:
                     self.after(0, lambda: self._log_write(f"   Skipped after {self._max_retries} retries", "err"))
-                    self._retry_count.pop(song, None)  # Resetta contatore
-                    self._download_next_song(out, quality)
+                    self.after(0, lambda s=song: self._queue_set_status(s, "error"))
+                    self._retry_count.pop(song, None)
+                    self._download_next_song(out, quality, fmt)
 
-        self._download_song_youtube(song, out, quality, on_complete)
+        self._download_song_youtube(song, out, quality, on_complete, fmt)
 
     def _run_ytdlp(self, song, out, quality):
         # Comando yt-dlp per cercare e scaricare da YouTube
@@ -1323,30 +1458,34 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self.after(0, lambda: self._log_write(f"❌ Error: {e}", "err"))
             self.after(0, lambda: self._set_status("Error", ERROR_CLR))
 
-    def _download_song_youtube(self, song, out, quality, on_complete):
+    def _download_song_youtube(self, song, out, quality, on_complete, fmt="mp3"):
         """Download a single song from YouTube (batch version)"""
         import time
         import threading
 
         # Determine if search or direct URL
-        is_youtube_mode = getattr(self, "_is_youtube_mode", False)
-        is_direct_url = is_youtube_mode and ("youtube.com" in song or "youtu.be" in song)
-        
-        if is_direct_url:
-            # Usa l'URL diretto
-            search_query = song
-            search_type = "URL YouTube"
-        else:
-            # Usa ytsearch per cercare su YouTube
-            search_query = f"ytsearch:{song}"
-            search_type = "searching"
+        is_youtube_mode    = getattr(self, "_is_youtube_mode", False)
+        is_soundcloud_mode = getattr(self, "_is_soundcloud_mode", False)
+        is_direct_url = (
+            (is_youtube_mode    and ("youtube.com" in song or "youtu.be" in song)) or
+            (is_soundcloud_mode and "soundcloud.com" in song)
+        )
 
+        if is_direct_url:
+            search_query = song
+            search_type  = "downloading"
+        else:
+            search_query = f"ytsearch:{song}"
+            search_type  = "searching"
+
+        # flac/wav non supportano bitrate: usa best quality automaticamente
+        audio_quality_args = ["--audio-quality", quality] if fmt not in ("flac", "wav") else []
         cmd = _find_cmd("yt-dlp") + [
             search_query,
             "-x",
             "-f", "bestaudio",
-            "--audio-format", "mp3",
-            "--audio-quality", quality,
+            "--audio-format", fmt,
+        ] + audio_quality_args + [
             "-o", os.path.join(out, "%(title)s.%(ext)s"),
             "--no-warnings",
             "--embed-metadata",
@@ -1779,6 +1918,384 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self.after(1200, lambda: self._restart_app(current if frozen else None))
         except Exception as e:
             self._log_write(f"❌ Rollback failed: {str(e)[:60]}", "err")
+
+
+    # ══════════════════════════════════════════
+    #  SOUNDCLOUD
+    # ══════════════════════════════════════════
+
+    def _is_soundcloud_url(self, url):
+        return "soundcloud.com" in url
+
+    def _get_soundcloud_playlist_name(self, url):
+        """Estrae il nome di un set SoundCloud dall'URL"""
+        try:
+            # URL format: soundcloud.com/artist/sets/playlist-name
+            parts = url.rstrip("/").split("/")
+            idx = parts.index("sets") if "sets" in parts else -1
+            if idx != -1 and idx + 1 < len(parts):
+                return parts[idx + 1].replace("-", " ").title()
+        except Exception:
+            pass
+        return "SoundCloud Playlist"
+
+    def _extract_soundcloud_playlist_songs(self, url):
+        """Estrae gli URL dei brani da un set SoundCloud tramite yt-dlp"""
+        try:
+            self.after(0, lambda: self._log_write("   📡 Extracting tracks from SoundCloud…", "dim"))
+            cmd = _find_cmd("yt-dlp") + [
+                url,
+                "--print", "original_url",
+                "--flat-playlist",
+                "--no-warnings",
+                "--quiet",
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace", creationflags=_NO_WINDOW,
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split("\n")
+                urls = [l.strip() for l in lines if "soundcloud.com" in l]
+                if urls:
+                    self.after(0, lambda n=len(urls): self._log_write(f"   Found {n} tracks", "ok"))
+                    return urls
+            err = (result.stderr or result.stdout or "")[:80].strip()
+            self.after(0, lambda e=err: self._log_write(f"   ⚠ SoundCloud extract error: {e}", "warn"))
+            return None
+        except Exception as e:
+            self.after(0, lambda e=e: self._log_write(f"   ⚠ {str(e)[:60]}", "warn"))
+            return None
+
+    # ══════════════════════════════════════════
+    #  QUEUE
+    # ══════════════════════════════════════════
+
+    def _queue_build(self, songs):
+        """Popola la queue con la lista canzoni"""
+        self._queue_map = {}   # song -> line_number (1-based)
+        self._queue_list.configure(state="normal")
+        self._queue_list.delete("1.0", "end")
+        for i, song in enumerate(songs, 1):
+            label = song if len(song) <= 80 else song[:77] + "…"
+            line = f"  ○  {label}\n"
+            self._queue_list.insert("end", line, "queued")
+            self._queue_map[song] = i
+        self._queue_list.configure(state="disabled")
+        self._queue_count_lbl.config(text=f"  {len(songs)} tracks")
+
+    def _queue_set_status(self, song, status):
+        """Aggiorna lo stato di una riga nella queue"""
+        if not hasattr(self, "_queue_map") or song not in self._queue_map:
+            return
+        line_no = self._queue_map[song]
+        icons = {
+            "queued":      "  ○  ",
+            "downloading": "  ▶  ",
+            "done":        "  ✓  ",
+            "error":       "  ✗  ",
+            "skipped":     "  —  ",
+        }
+        icon = icons.get(status, "  ○  ")
+        self._queue_list.configure(state="normal")
+        line_start = f"{line_no}.0"
+        line_end   = f"{line_no}.end"
+        current = self._queue_list.get(line_start, line_end)
+        # Sostituisci solo i primi 5 caratteri (l'icona)
+        new_line = icon + current[5:]
+        self._queue_list.delete(line_start, line_end)
+        self._queue_list.insert(line_start, new_line, status)
+        self._queue_list.configure(state="disabled")
+        # Scrolla per mostrare la riga attiva
+        if status == "downloading":
+            self._queue_list.see(line_start)
+
+    def _queue_clear(self):
+        self._queue_list.configure(state="normal")
+        self._queue_list.delete("1.0", "end")
+        self._queue_list.configure(state="disabled")
+        self._queue_count_lbl.config(text="")
+        self._queue_map = {}
+
+    # ══════════════════════════════════════════
+    #  WINDOWS NOTIFICATION
+    # ══════════════════════════════════════════
+
+    def _notify_complete(self, total):
+        """Mostra notifica Windows al termine del download"""
+        try:
+            # Usa PowerShell per mostrare una toast notification nativa
+            msg = f"Download complete: {total} song{'s' if total != 1 else ''} saved."
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "$n = New-Object System.Windows.Forms.NotifyIcon;"
+                "$n.Icon = [System.Drawing.SystemIcons]::Information;"
+                "$n.Visible = $true;"
+                f'$n.ShowBalloonTip(4000, "Pythofy", "{msg}", '
+                "[System.Windows.Forms.ToolTipIcon]::None);"
+                "Start-Sleep -Milliseconds 4500;"
+                "$n.Visible = $false"
+            )
+            subprocess.Popen(
+                ["powershell", "-WindowStyle", "Hidden", "-Command", script],
+                creationflags=_NO_WINDOW,
+            )
+        except Exception:
+            pass  # Notifica opzionale, non blocca nulla
+
+    # ══════════════════════════════════════════
+    #  DRAG & DROP
+    # ══════════════════════════════════════════
+
+
+    # ══════════════════════════════════════════
+    #  CLEAR CSV
+    # ══════════════════════════════════════════
+
+    def _clear_csv(self):
+        self._csv_songs = None
+        self._csv_file_name = None
+        self._csv_var.set("")
+        self._log_write("CSV cleared", "dim")
+
+    # ══════════════════════════════════════════
+    #  SONGS WINDOW
+    # ══════════════════════════════════════════
+
+    def _open_songs_window(self):
+        """Apre la finestra Songs con pannello cartelle + canzoni"""
+        base_dir = self._dir_var.get().strip()
+        if not os.path.exists(base_dir):
+            messagebox.showinfo("Songs", "Destination folder does not exist yet.")
+            return
+
+        # Scansiona il JSON e la cartella
+        done_file = self._done_file_path(base_dir)
+        all_data = {}  # folder_path -> list of song names
+        audio_exts = {".mp3", ".flac", ".m4a", ".ogg", ".wav", ".opus"}
+
+        try:
+            json_data = {}
+            if os.path.exists(done_file):
+                with open(done_file, "r", encoding="utf-8") as f:
+                    json_data = json.load(f)
+        except Exception:
+            json_data = {}
+
+        # Costruisci struttura: usa il JSON come fonte primaria,
+        # integra con scan disco per file non tracciati
+        for folder_key, songs in json_data.items():
+            if os.path.exists(folder_key):
+                all_data[folder_key] = list(songs)
+
+        # Scan disco per file non nel JSON
+        for root_dir, dirs, files in os.walk(base_dir):
+            audio_files = [f for f in files if os.path.splitext(f)[1].lower() in audio_exts]
+            if not audio_files:
+                continue
+            if root_dir not in all_data:
+                all_data[root_dir] = []
+            existing_in_json = set(all_data[root_dir])
+            for f in audio_files:
+                stem = os.path.splitext(f)[0]
+                if stem not in existing_in_json:
+                    all_data[root_dir].append(f"📁 {stem}")
+
+        if not all_data:
+            messagebox.showinfo("Songs", "No downloaded songs found.")
+            return
+
+        # ── Costruisci finestra ──────────────────────────────
+        win = tk.Toplevel(self)
+        win.title("Songs")
+        win.configure(bg=BG)
+        win.geometry("900x580")
+        win.minsize(700, 400)
+
+        # Header
+        hdr = tk.Frame(win, bg=BG2, height=40)
+        hdr.pack(fill="x", side="top")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="SONGS", font=(MONO, 9, "bold"), bg=BG2, fg=ACCENT).pack(side="left", padx=14)
+        total_songs = sum(len(v) for v in all_data.values())
+        tk.Label(hdr, text=f"{total_songs} tracks  ·  {len(all_data)} folders",
+                 font=(MONO, 8), bg=BG2, fg=TEXT_SUB).pack(side="left", padx=(0, 0))
+        tk.Frame(win, bg=BORDER, height=1).pack(fill="x", side="top")
+
+        # Body: pannello sinistro + separatore + pannello destro
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True)
+
+        # ── LEFT: lista cartelle ──────────────────────────────
+        left = tk.Frame(body, bg=BG, width=260)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+
+        tk.Label(left, text="FOLDERS", font=(MONO, 7, "bold"), bg=BG, fg=TEXT_DIM).pack(
+            anchor="w", padx=14, pady=(10, 4))
+
+        folder_list_frame = tk.Frame(left, bg=BG)
+        folder_list_frame.pack(fill="both", expand=True)
+
+        folder_lb = tk.Listbox(folder_list_frame,
+            bg=BG, fg=TEXT_MID, selectbackground=BG4, selectforeground=ACCENT,
+            font=(SANS, 9), relief="flat", bd=0, highlightthickness=0,
+            activestyle="none", cursor="hand2")
+        folder_sb = ttk.Scrollbar(folder_list_frame, orient="vertical", command=folder_lb.yview)
+        folder_lb.configure(yscrollcommand=folder_sb.set)
+        folder_sb.pack(side="right", fill="y")
+        folder_lb.pack(side="left", fill="both", expand=True, padx=(14, 0))
+
+        folder_keys = list(all_data.keys())
+        for fk in folder_keys:
+            name = os.path.basename(fk) or fk
+            count = len(all_data[fk])
+            folder_lb.insert("end", f"  {name}  ({count})")
+
+        tk.Frame(body, bg=BORDER, width=1).pack(side="left", fill="y")
+
+        # ── RIGHT: lista canzoni ──────────────────────────────
+        right = tk.Frame(body, bg=BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        right_hdr = tk.Frame(right, bg=BG2, height=32)
+        right_hdr.pack(fill="x", side="top")
+        right_hdr.pack_propagate(False)
+        self._songs_win_folder_lbl = tk.Label(right_hdr, text="Select a folder",
+            font=(MONO, 8), bg=BG2, fg=TEXT_MID)
+        self._songs_win_folder_lbl.pack(side="left", padx=14)
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", side="top")
+
+        songs_frame = tk.Frame(right, bg=BG)
+        songs_frame.pack(fill="both", expand=True)
+
+        songs_lb = tk.Listbox(songs_frame,
+            bg=BG, fg=TEXT, selectbackground=BG4, selectforeground=ACCENT,
+            font=(SANS, 9), relief="flat", bd=0, highlightthickness=0,
+            activestyle="none", cursor="hand2")
+        songs_sb = ttk.Scrollbar(songs_frame, orient="vertical", command=songs_lb.yview)
+        songs_lb.configure(yscrollcommand=songs_sb.set)
+        songs_sb.pack(side="right", fill="y")
+        songs_lb.pack(side="left", fill="both", expand=True, padx=(14, 0), pady=4)
+
+        # Statusbar / action bar in fondo
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", side="bottom")
+        action_bar = tk.Frame(right, bg=BG2, height=36)
+        action_bar.pack(fill="x", side="bottom")
+        action_bar.pack_propagate(False)
+        self._songs_win_status = tk.Label(action_bar, text="",
+            font=(MONO, 8), bg=BG2, fg=TEXT_SUB)
+        self._songs_win_status.pack(side="left", padx=14)
+
+        open_folder_btn = self._ghost_btn(action_bar, "OPEN FOLDER", lambda: None)
+        open_folder_btn.pack(side="right", padx=(0, 8), pady=4)
+        delete_btn = self._ghost_btn(action_bar, "DELETE", lambda: None)
+        delete_btn.pack(side="right", padx=(0, 4), pady=4)
+
+        # ── Stato condiviso tra callbacks ────────────────────
+        state = {"folder": None, "song_name": None}
+
+        def on_folder_select(e):
+            sel = folder_lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            fk = folder_keys[idx]
+            state["folder"] = fk
+            state["song_name"] = None
+            name = os.path.basename(fk) or fk
+            self._songs_win_folder_lbl.config(text=name)
+            songs_lb.delete(0, "end")
+            for s in all_data[fk]:
+                songs_lb.insert("end", f"  {s}")
+            self._songs_win_status.config(text=f"{len(all_data[fk])} tracks")
+
+        def on_song_select(e):
+            sel = songs_lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            fk = state["folder"]
+            if not fk:
+                return
+            song = all_data[fk][idx]
+            state["song_name"] = song
+            self._songs_win_status.config(text=song[:80])
+
+        def do_open_folder():
+            fk = state["folder"]
+            if not fk or not os.path.exists(fk):
+                return
+            if sys.platform == "win32":
+                os.startfile(fk)
+            else:
+                subprocess.Popen(["xdg-open", fk])
+
+        def do_delete():
+            fk = state["folder"]
+            sn = state["song_name"]
+            if not fk or not sn:
+                messagebox.showinfo("Delete", "Select a song first.", parent=win)
+                return
+
+            if not messagebox.askyesno("Delete", f'Delete "{sn}" and remove from history?', parent=win):
+                return
+
+            # Cerca il file su disco
+            audio_exts_list = [".mp3", ".flac", ".m4a", ".ogg", ".wav", ".opus"]
+            deleted_file = False
+            sn_clean = sn.lstrip("📁 ")
+            if os.path.exists(fk):
+                for fname in os.listdir(fk):
+                    stem = os.path.splitext(fname)[0]
+                    if stem.lower() == sn_clean.lower() or stem == sn_clean:
+                        fpath = os.path.join(fk, fname)
+                        try:
+                            os.remove(fpath)
+                            deleted_file = True
+                        except Exception as ex:
+                            messagebox.showerror("Error", f"Could not delete file:\n{ex}", parent=win)
+                            return
+                        break
+
+            # Rimuovi dal JSON
+            try:
+                if os.path.exists(done_file):
+                    with open(done_file, "r", encoding="utf-8") as f:
+                        jdata = json.load(f)
+                    if fk in jdata and sn in jdata[fk]:
+                        jdata[fk].remove(sn)
+                        with open(done_file, "w", encoding="utf-8") as f:
+                            json.dump(jdata, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # Aggiorna UI
+            all_data[fk].remove(sn)
+            sel = songs_lb.curselection()
+            if sel:
+                songs_lb.delete(sel[0])
+            state["song_name"] = None
+            self._songs_win_status.config(
+                text=f"{'Deleted  ·  ' if deleted_file else 'Removed from history  ·  '}{len(all_data[fk])} tracks remaining")
+
+            # Aggiorna contatore cartella nella lista sinistra
+            sel_f = folder_lb.curselection()
+            if sel_f:
+                name = os.path.basename(fk) or fk
+                folder_lb.delete(sel_f[0])
+                folder_lb.insert(sel_f[0], f"  {name}  ({len(all_data[fk])})")
+                folder_lb.selection_set(sel_f[0])
+
+        open_folder_btn.config(command=do_open_folder)
+        delete_btn.config(command=do_delete)
+        folder_lb.bind("<<ListboxSelect>>", on_folder_select)
+        songs_lb.bind("<<ListboxSelect>>", on_song_select)
+
+        # Seleziona prima cartella automaticamente
+        if folder_keys:
+            folder_lb.selection_set(0)
+            folder_lb.event_generate("<<ListboxSelect>>")
 
 
     def _on_done(self):
