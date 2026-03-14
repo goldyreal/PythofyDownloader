@@ -64,7 +64,7 @@ BORDER    = "#222222"   # default border
 MONO      = "Arial"
 SANS      = "Arial"
 
-APP_VERSION  = "1.4.0"
+APP_VERSION  = "1.5.0"
 GITHUB_REPO  = "goldyreal/PythofyDownloader"
 
 
@@ -106,6 +106,9 @@ class YouTubeDownloaderApp(tk.Tk):
 
         self._process = None
         self._running = False
+        self._pending_batches = []   # lista di (url, out, quality, csv_songs, fmt)
+        self._downloaded_urls = set()  # URL già scaricati o in coda (deduplicazione)
+        self._queue_session_active = False  # True se la queue è "in uso"
         self._num_songs_var = tk.IntVar(value=100)
         self._csv_songs = None
         self._csv_file_name = None
@@ -203,19 +206,35 @@ class YouTubeDownloaderApp(tk.Tk):
 
         inner.bind("<Configure>", on_configure)
         canvas.bind("<Configure>", on_canvas_resize)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(
-            int(-1*(e.delta/120)), "units"))
+        def _on_canvas_scroll(e):
+            # Scrolla il canvas solo se il popup dei suggerimenti NON è aperto
+            if getattr(self, "_suggest_popup", None) and self._suggest_popup.winfo_exists():
+                return
+            canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_canvas_scroll)
 
         pad = dict(padx=28)
 
         # SOURCE
-        self._section_label(inner, "SPOTIFY, YOUTUBE OR SOUNDCLOUD URL").pack(anchor="w", pady=(28, 10), **pad)
+        self._section_label(inner, "URL OR SONG NAME (Spotify / YouTube / SoundCloud)").pack(anchor="w", pady=(28, 10), **pad)
         url_wrap = tk.Frame(inner, bg=BG)
         url_wrap.pack(fill="x", **pad)
         url_wrap.columnconfigure(0, weight=1)
         self._song_var = tk.StringVar()
-        self._entry(url_wrap, self._song_var).grid(row=0, column=0, sticky="ew", ipady=10)
+        self._url_entry = self._entry(url_wrap, self._song_var)
+        self._url_entry.grid(row=0, column=0, sticky="ew", ipady=10)
         self._ghost_btn(url_wrap, "PASTE", self._paste_text).grid(row=0, column=1, padx=(8, 0))
+
+        # Dropdown autocomplete — popup Toplevel (funziona dentro canvas scorrevole)
+        self._search_results_data = []
+        self._search_after_id = None
+        self._suggest_popup = None
+
+        # Bind per la ricerca in tempo reale
+        self._song_var.trace_add("write", self._on_url_changed)
+        self._url_entry.bind("<FocusOut>", self._hide_suggestions_delayed)
+        self._url_entry.bind("<Escape>", lambda e: self._hide_suggestions())
+        self._url_entry.bind("<Down>", self._focus_suggestions)
 
         # DESTINATION
         self._section_label(inner, "DESTINATION").pack(anchor="w", pady=(22, 10), **pad)
@@ -596,43 +615,309 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         except Exception as e:
             messagebox.showerror("CSV Error", f"Unable to read the file:\n{e}")
 
+    # ── Ricerca / Autocomplete ─────────────────────
+    def _is_plain_search(self, text):
+        """True se il testo non è un URL ma una ricerca libera"""
+        return bool(text) and not any(x in text for x in (
+            "spotify.com", "youtube.com", "youtu.be", "soundcloud.com", "http://", "https://"
+        ))
+
+    def _on_url_changed(self, *args):
+        if getattr(self, "_selecting", False):
+            return
+        text = self._song_var.get().strip()
+        if self._search_after_id:
+            self.after_cancel(self._search_after_id)
+            self._search_after_id = None
+        if len(text) >= 3 and self._is_plain_search(text):
+            # Se il popup è già aperto con risultati, aspetta meno e appende
+            delay = 300 if (self._suggest_popup and self._suggest_popup.winfo_exists()) else 600
+            self._search_after_id = self.after(delay, lambda t=text: self._run_search_async(t, append=self._suggest_popup is not None and self._suggest_popup.winfo_exists()))
+        else:
+            # Testo cancellato o URL: chiudi E cancella la ricerca in corso
+            self._cancel_search()
+            self._close_popup()
+
+    def _cancel_search(self):
+        """Incrementa il token per fermare qualsiasi thread di ricerca attivo."""
+        self._search_token = getattr(self, "_search_token", 0) + 1
+
+    def _run_search_async(self, query, append=False):
+        # Nuovo token = vecchio thread si ferma
+        self._search_token = getattr(self, "_search_token", 0) + 1
+        token = self._search_token
+        # Se NON stiamo appendendo, svuota il popup esistente
+        if not append:
+            if self._suggest_popup and self._suggest_popup.winfo_exists():
+                self._suggest_listbox.delete(0, "end")
+                self._search_results_data = []
+        threading.Thread(
+            target=self._fetch_suggestions_streaming,
+            args=(query, token),
+            daemon=True
+        ).start()
+
+    def _fetch_suggestions_streaming(self, query, token):
+        """
+        Lancia yt-dlp con --no-flat-playlist e legge stdout riga per riga:
+        ogni risultato viene spedito alla UI appena arriva, senza aspettare
+        che finiscano tutti e 10.
+        """
+        MAX_RESULTS = 10
+        try:
+            cmd = _find_cmd("yt-dlp") + [
+                f"ytsearch{MAX_RESULTS}:{query}",
+                "--print", "%(title)s|||%(uploader)s|||%(duration_string)s|||%(webpage_url)s",
+                "--no-playlist", "--no-warnings", "--quiet",
+                "--extractor-args", "youtube:skip=dash,hls",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, creationflags=_NO_WINDOW
+            )
+            for raw_line in proc.stdout:
+                # Se la query è cambiata (nuovo token), abbandona
+                if getattr(self, "_search_token", 0) != token:
+                    proc.terminate()
+                    return
+                line = raw_line.strip()
+                if "|||" not in line:
+                    continue
+                parts = line.split("|||")
+                if len(parts) >= 4:
+                    item = {"title": parts[0], "uploader": parts[1],
+                            "duration": parts[2], "url": parts[3]}
+                    self.after(0, lambda it=item, tk=token: self._append_suggestion(it, tk))
+            proc.wait()
+        except Exception:
+            pass
+
+    def _append_suggestion(self, item, token):
+        """Aggiunge un risultato al popup esistente, o lo crea se non c'è ancora."""
+        if getattr(self, "_selecting", False):
+            return
+        if getattr(self, "_search_token", 0) != token:
+            return
+        # Non aprire il popup se il campo è vuoto o è diventato un URL
+        current = self._song_var.get().strip()
+        if not self._is_plain_search(current):
+            return
+
+        # Crea il popup solo se non esiste — mai ricrearlo se è già aperto
+        if self._suggest_popup is None or not self._suggest_popup.winfo_exists():
+            self._search_results_data = []
+            self._create_popup()
+
+        self._search_results_data.append(item)
+        lb = self._suggest_listbox
+        lb.insert("end", f"  {item['title']}  —  {item['uploader']}  [{item['duration']}]")
+
+        # Ridimensiona il popup: max 5 righe visibili (scrollabile oltre)
+        ROW_H   = 26
+        MAX_VIS = 5
+        n       = lb.size()
+        vis     = min(n, MAX_VIS)
+        lb.config(height=vis)
+
+        self._url_entry.update_idletasks()
+        x = self._url_entry.winfo_rootx()
+        y = self._url_entry.winfo_rooty() + self._url_entry.winfo_height() + 2
+        w = self._url_entry.winfo_width()
+        # +16 per la scrollbar verticale se presente
+        self._suggest_popup.geometry(f"{w}x{vis * ROW_H + 4}+{x}+{y}")
+
+    def _create_popup(self):
+        """Crea la finestra popup con listbox + scrollbar, senza dati."""
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.configure(bg=ACCENT3)
+        popup.wm_attributes("-topmost", True)
+        self._suggest_popup = popup
+
+        frame = tk.Frame(popup, bg=BG2)
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+
+        sb = ttk.Scrollbar(frame, orient="vertical")
+        sb.pack(side="right", fill="y")
+
+        lb = tk.Listbox(
+            frame,
+            font=(SANS, 9), bg=BG2, fg=TEXT,
+            selectbackground=BG4, selectforeground=TEXT,
+            relief="flat", bd=0, activestyle="none",
+            highlightthickness=0, height=1,
+            yscrollcommand=sb.set
+        )
+        lb.pack(side="left", fill="both", expand=True)
+        sb.config(command=lb.yview)
+        self._suggest_listbox = lb
+
+        # Hover effect
+        def on_motion(e, _lb=lb):
+            idx = _lb.nearest(e.y)
+            for i in range(_lb.size()):
+                _lb.itemconfig(i,
+                    bg=BG4 if i == idx else BG2,
+                    fg=ACCENT if i == idx else TEXT)
+
+        def on_leave(e, _lb=lb):
+            for i in range(_lb.size()):
+                _lb.itemconfig(i, bg=BG2, fg=TEXT)
+
+        lb.bind("<Motion>", on_motion)
+        lb.bind("<Leave>", on_leave)
+        lb.bind("<ButtonRelease-1>", self._on_suggest_select)
+        lb.bind("<Return>", self._on_suggest_select)
+        lb.bind("<Escape>", lambda e: self._close_popup())
+
+        # MouseWheel sul popup: scrolla la listbox e blocca la propagazione al canvas
+        def _on_popup_scroll(e, _lb=lb):
+            _lb.yview_scroll(int(-1*(e.delta/120)), "units")
+            return "break"  # "break" impedisce la propagazione a bind_all
+        lb.bind("<MouseWheel>", _on_popup_scroll)
+        popup.bind("<MouseWheel>", _on_popup_scroll)
+
+    def _show_suggestions(self, items, query):
+        pass  # non usato, tenuto per compatibilità
+
+    def _close_popup(self):
+        """Chiude il popup E cancella la ricerca in corso."""
+        # Incrementa il token: qualsiasi thread attivo si fermerà al prossimo ciclo
+        self._search_token = getattr(self, "_search_token", 0) + 1
+        if self._suggest_popup and self._suggest_popup.winfo_exists():
+            self._suggest_popup.destroy()
+        self._suggest_popup = None
+
+    def _hide_suggestions(self):
+        self._close_popup()
+        self._search_results_data = []
+
+    def _hide_suggestions_delayed(self, event=None):
+        def _maybe_hide():
+            # Non nascondere se il focus è finito nel popup (scrollbar, listbox, ecc.)
+            focused = self.focus_get()
+            popup = getattr(self, "_suggest_popup", None)
+            if popup and popup.winfo_exists():
+                try:
+                    # Controlla se il widget con il focus è dentro il popup
+                    w = focused
+                    while w is not None:
+                        if w == popup:
+                            return  # focus è dentro il popup, non chiudere
+                        w = w.master
+                except Exception:
+                    pass
+            self._hide_suggestions()
+        self.after(200, _maybe_hide)
+
+    def _focus_suggestions(self, event=None):
+        if self._suggest_popup and self._suggest_popup.winfo_exists():
+            self._suggest_listbox.focus_set()
+            self._suggest_listbox.selection_set(0)
+
+    def _on_suggest_select(self, event=None):
+        # Leggi i dati PRIMA di qualsiasi modifica allo stato
+        data = list(self._search_results_data)
+        lb = self._suggest_listbox
+        idx = lb.nearest(event.y) if event else None
+        if idx is None:
+            sel = lb.curselection()
+            idx = sel[0] if sel else None
+        if idx is None or not (0 <= idx < len(data)):
+            return
+        chosen_url = data[idx]["url"]
+
+        # Blocca il trace, chiudi popup, imposta URL
+        self._selecting = True
+        self._close_popup()
+        self._search_results_data = []
+        if self._search_after_id:
+            self.after_cancel(self._search_after_id)
+            self._search_after_id = None
+        self._song_var.set(chosen_url)
+        self._selecting = False
+        self._url_entry.focus_set()
+        self._url_entry.icursor("end")
+
     def _start_download(self):
         url = self._song_var.get().strip()
         out = self._dir_var.get().strip()
         csv_songs = getattr(self, "_csv_songs", None)
 
         if not url and not csv_songs:
-            messagebox.showwarning("Missing input", "Enter a Spotify/YouTube URL or import a CSV file.")
+            messagebox.showwarning("Missing input", "Enter a URL, a song name, or import a CSV file.")
             return
-        
-        # URL validation
+
+        is_search     = self._is_plain_search(url) if url else False
         is_spotify    = url and "spotify.com" in url
         is_youtube    = url and ("youtube.com" in url or "youtu.be" in url)
         is_soundcloud = url and "soundcloud.com" in url
 
-        if url and not is_spotify and not is_youtube and not is_soundcloud:
-            messagebox.showwarning("Invalid URL", "Use a Spotify, YouTube or SoundCloud URL.")
+        if url and not is_spotify and not is_youtube and not is_soundcloud and not is_search:
+            messagebox.showwarning("Invalid input", "Use a Spotify, YouTube or SoundCloud URL, or type a song name.")
             return
 
         if url and is_spotify:
             if not ("playlist" in url or "track" in url):
                 messagebox.showwarning("Invalid Spotify URL", "Use a Spotify track or playlist link.")
                 return
-        
+
         if not out:
             messagebox.showwarning("Missing folder", "Select a destination folder.")
             return
 
         os.makedirs(out, exist_ok=True)
         _save_config({"last_dest": out})
+        self._hide_suggestions()
 
+        # Se è ricerca libera, converti in ytsearch per yt-dlp
+        if is_search:
+            url = f"ytsearch1:{url}"
+
+        fmt     = self._fmt_var.get()
+        quality = self._qual_var.get()
+
+        # Deduplicazione: non accodare lo stesso URL due volte
+        url_key = url or "csv"
+        if url_key in self._downloaded_urls:
+            self._log_write(f"⚠ Already queued or downloaded: {url_key}", "warn")
+            return
+        self._downloaded_urls.add(url_key)
+
+        if self._running:
+            # Download in corso: accoda il batch
+            self._pending_batches.append((url, out, quality, csv_songs, fmt))
+            # Mostra subito separatore + placeholder nella queue
+            label = url if url else "CSV import"
+            # Accorcia l'URL per mostrarlo leggibile
+            if "spotify.com" in label:
+                label = "Spotify: " + label.split("/")[-1].split("?")[0]
+            elif "youtube.com" in label or "youtu.be" in label:
+                label = "YouTube: " + label.split("v=")[-1].split("&")[0] if "v=" in label else label
+            elif "soundcloud.com" in label:
+                label = "SoundCloud: " + label.rstrip("/").split("/")[-1]
+            elif label.startswith("ytsearch"):
+                label = label.replace("ytsearch1:", "🔍 ")
+            self._queue_append_placeholder(label)
+            return
+
+        # Nessun download in corso: resetta la queue se la sessione precedente è finita
+        if not self._queue_session_active:
+            self._queue_clear()
+            self._downloaded_urls = {url_key}  # ricomincia tracking
+
+        self._queue_session_active = True
         self._running = True
-        self._dl_btn.config(state="disabled")
+        self._dl_btn.config(state="normal")   # rimane cliccabile per accodare
         self._stop_btn.config(state="normal")
         self._progress.start(12)
-        self._set_status("Estrazione canzoni\u2026", WARN_CLR)
+        self._set_status("Searching…" if is_search else "Extracting…", WARN_CLR)
+
         if url:
-            if is_youtube:
+            if is_search:
+                self._log_write(f"🔍 Searching: {url}", "bold")
+            elif is_youtube:
                 self._log_write(f"URL YouTube: {url}", "bold")
             elif is_soundcloud:
                 self._log_write(f"URL SoundCloud: {url}", "bold")
@@ -641,14 +926,15 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         self._log_write(f"Destination: {out}", "dim")
 
         threading.Thread(target=self._extract_and_download,
-                         args=(url, out, self._qual_var.get(), csv_songs, self._fmt_var.get()),
+                         args=(url, out, quality, csv_songs, fmt),
                          daemon=True).start()
 
     def _extract_and_download(self, spotify_url, out, quality, csv_songs=None, fmt="mp3"):
         """Extract songs from Spotify/YouTube/SoundCloud and download them"""
         try:
             # Determina il tipo di URL e source
-            is_youtube    = self._is_youtube_url(spotify_url) if spotify_url else False
+            is_ytsearch   = spotify_url and spotify_url.startswith("ytsearch")
+            is_youtube    = is_ytsearch or (self._is_youtube_url(spotify_url) if spotify_url else False)
             is_soundcloud = self._is_soundcloud_url(spotify_url) if spotify_url else False
             if is_youtube:
                 source = "youtube"
@@ -671,7 +957,11 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 # Gestisci download da YouTube
                 self.after(0, lambda: self._log_write("YouTube URL detected", "dim"))
 
-                if self._is_youtube_playlist_url(spotify_url):
+                if is_ytsearch:
+                    is_playlist = False
+                    self.after(0, lambda: self._log_write("   Search mode (single track)", "dim"))
+                    songs = [spotify_url]  # yt-dlp gestisce ytsearch1: direttamente
+                elif self._is_youtube_playlist_url(spotify_url):
                     is_playlist = True
                     self.after(0, lambda: self._log_write("   Playlist found", "dim"))
                     playlist_name = self._get_youtube_playlist_name(spotify_url)
@@ -761,7 +1051,11 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self._current_song_idx = 0
             self._is_youtube_mode = is_youtube
             self._is_soundcloud_mode = is_soundcloud
-            self.after(0, lambda s=songs: self._queue_build(s))
+            # Se c'è un placeholder da batch accodato, sostituiscilo; altrimenti append normale
+            if getattr(self, "_placeholder_line", None) is not None:
+                self.after(0, lambda s=songs: self._queue_replace_placeholder(s))
+            else:
+                self.after(0, lambda s=songs: self._queue_append(s))
             self._download_next_song(out, quality, fmt)
 
         except Exception as e:
@@ -1350,8 +1644,20 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 total = len(self._songs_list)
                 self.after(0, lambda: self._log_write(
                     f"✓ Complete! ({total} songs)", "ok"))
-                self.after(0, lambda: self._set_status("Complete", ACCENT))
-                self._notify_complete(total)
+                # Controlla se ci sono batch in coda
+                if self._pending_batches:
+                    next_url, next_out, next_quality, next_csv, next_fmt = self._pending_batches.pop(0)
+                    self.after(0, lambda u=next_url: self._log_write(f"▶ Starting queued batch: {u}", "bold"))
+                    threading.Thread(
+                        target=self._extract_and_download,
+                        args=(next_url, next_out, next_quality, next_csv, next_fmt),
+                        daemon=True
+                    ).start()
+                    return  # non chiamare _on_done, stiamo continuando
+                else:
+                    self.after(0, lambda: self._set_status("Complete", ACCENT))
+                    self._notify_complete(total)
+                    self._queue_session_active = False  # sessione finita, prossimo click fa reset
             self._running = False
             self.after(0, self._on_done)
             return
@@ -1414,14 +1720,16 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         # Comando yt-dlp per cercare e scaricare da YouTube
         cmd = _find_cmd("yt-dlp") + [
             f"ytsearch:{song}",
-            "-x",  # Estrai solo audio
+            "-x",
             "-f", "bestaudio",
             "--audio-format", "mp3",
             "--audio-quality", quality,
-            "-o", os.path.join(out, "%(title)s.%(ext)s"),
+            "-o", os.path.join(out, "%(artist,uploader)s - %(title)s.%(ext)s"),
             "--no-warnings",
             "--embed-metadata",
-            "--embed-thumbnail",
+            "--add-metadata",
+            "--parse-metadata", "title:%(artist)s - %(title)s",
+            "--parse-metadata", r"%(title)s:(?P<title>.+?)(?:\s*[\(\[].+?[\)\]])*\s*$",
         ]
         
         try:
@@ -1486,10 +1794,13 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             "-f", "bestaudio",
             "--audio-format", fmt,
         ] + audio_quality_args + [
-            "-o", os.path.join(out, "%(title)s.%(ext)s"),
+            # Nome file: "Artista - Titolo" se l'artista è disponibile, altrimenti solo titolo
+            "-o", os.path.join(out, "%(artist,uploader)s - %(title)s.%(ext)s"),
             "--no-warnings",
             "--embed-metadata",
-            "--embed-thumbnail",
+            "--add-metadata",
+            "--parse-metadata", "title:%(artist)s - %(title)s",
+            "--parse-metadata", r"%(title)s:(?P<title>.+?)(?:\s*[\(\[].+?[\)\]])*\s*$",
         ]
 
         try:
@@ -1575,8 +1886,8 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             reader_thread = threading.Thread(target=read_output, daemon=True)
             reader_thread.start()
 
-            # Wait for process with timeout (15 min)
-            self._process.wait(timeout=900)
+            # Wait for process with timeout (3 min per canzone)
+            self._process.wait(timeout=180)
             rc = self._process.returncode
 
             # Wait for reader to finish
@@ -1596,7 +1907,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                     pass
             if self._running:
                 self.after(0, lambda: self._log_write(
-                    f"⚠ Download timeout (> 15 min), saltato", "warn"))
+                    f"⚠ Download timeout (> 3 min), saltato", "warn"))
                 on_complete(False)
         except Exception as e:
             # Assicurati che il processo sia terminato
@@ -1972,17 +2283,99 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
     # ══════════════════════════════════════════
 
     def _queue_build(self, songs):
-        """Popola la queue con la lista canzoni"""
-        self._queue_map = {}   # song -> line_number (1-based)
+        """Prima chiamata: resetta e costruisce la queue da zero."""
+        self._queue_map = {}
+        self._queue_total = 0
+        self._queue_line_counter = 0
+        self._placeholder_line = None
+        self._placeholder_line = None
         self._queue_list.configure(state="normal")
         self._queue_list.delete("1.0", "end")
-        for i, song in enumerate(songs, 1):
-            label = song if len(song) <= 80 else song[:77] + "…"
-            line = f"  ○  {label}\n"
-            self._queue_list.insert("end", line, "queued")
-            self._queue_map[song] = i
         self._queue_list.configure(state="disabled")
-        self._queue_count_lbl.config(text=f"  {len(songs)} tracks")
+        self._queue_append(songs)
+
+    def _queue_append_placeholder(self, label):
+        """Mostra subito separatore + riga pending nella queue, prima che le canzoni siano estratte."""
+        if not hasattr(self, "_queue_map"):
+            self._queue_map = {}
+        if not hasattr(self, "_queue_line_counter"):
+            self._queue_line_counter = 0
+
+        self._queue_list.configure(state="normal")
+        # Separatore
+        if self._queue_line_counter > 0:
+            self._queue_list.insert("end", "  " + "─" * 36 + "\n", "skipped")
+            self._queue_line_counter += 1
+        # Placeholder — verrà sostituito da _queue_replace_placeholder quando le canzoni arrivano
+        display = label if len(label) <= 72 else label[:69] + "…"
+        self._queue_list.insert("end", f"  ⏳  {display} (loading…)\n", "dim")
+        self._queue_line_counter += 1
+        self._placeholder_line = self._queue_line_counter  # salva la riga del placeholder
+        self._queue_list.configure(state="disabled")
+
+    def _queue_replace_placeholder(self, songs):
+        """Sostituisce il placeholder con le canzoni reali, oppure fa _queue_append normale."""
+        placeholder_line = getattr(self, "_placeholder_line", None)
+        if placeholder_line is None:
+            # Nessun placeholder da sostituire, append normale
+            self._queue_append(songs)
+            return
+
+        self._queue_list.configure(state="normal")
+        # Elimina la riga placeholder
+        line_start = f"{placeholder_line}.0"
+        line_end   = f"{placeholder_line}.end+1c"
+        self._queue_list.delete(line_start, line_end)
+        # Aggiusta il contatore: la riga placeholder è sparita
+        self._queue_line_counter -= 1
+        self._placeholder_line = None
+        self._queue_list.configure(state="disabled")
+        # Inserisci le canzoni reali a partire da placeholder_line
+        self._queue_insert_at(songs, placeholder_line)
+
+    def _queue_insert_at(self, songs, start_line):
+        """Inserisce canzoni a una riga specifica del Text widget."""
+        if not hasattr(self, "_queue_map"):
+            self._queue_map = {}
+        self._queue_list.configure(state="normal")
+        for i, song in enumerate(songs):
+            line_no = start_line + i
+            label = song if len(song) <= 80 else song[:77] + "…"
+            self._queue_list.insert(f"{line_no}.0", f"  ○  {label}\n", "queued")
+            self._queue_map[song] = line_no
+            self._queue_line_counter += 1
+        if not hasattr(self, "_queue_total"):
+            self._queue_total = 0
+        self._queue_total += len(songs)
+        self._queue_list.configure(state="disabled")
+        self._queue_count_lbl.config(text=f"  {self._queue_total} tracks")
+
+    def _queue_append(self, songs):
+        """Aggiunge un batch di canzoni alla queue, con separatore se non è il primo."""
+        if not hasattr(self, "_queue_map"):
+            self._queue_map = {}
+        if not hasattr(self, "_queue_line_counter"):
+            self._queue_line_counter = 0  # numero di righe già nel widget
+
+        self._queue_list.configure(state="normal")
+
+        # Aggiungi separatore se ci sono già righe
+        if self._queue_line_counter > 0:
+            self._queue_list.insert("end", "  " + "─" * 36 + "\n", "skipped")
+            self._queue_line_counter += 1
+
+        # Inserisci le canzoni — ogni riga va a _queue_line_counter+1 (1-based)
+        for song in songs:
+            self._queue_line_counter += 1
+            label = song if len(song) <= 80 else song[:77] + "…"
+            self._queue_list.insert("end", f"  ○  {label}\n", "queued")
+            self._queue_map[song] = self._queue_line_counter
+
+        if not hasattr(self, "_queue_total"):
+            self._queue_total = 0
+        self._queue_total += len(songs)
+        self._queue_list.configure(state="disabled")
+        self._queue_count_lbl.config(text=f"  {self._queue_total} tracks")
 
     def _queue_set_status(self, song, status):
         """Aggiorna lo stato di una riga nella queue"""
@@ -1994,7 +2387,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             "downloading": "  ▶  ",
             "done":        "  ✓  ",
             "error":       "  ✗  ",
-            "skipped":     "  —  ",
+            "skipped":     "  Skipped —  ",
         }
         icon = icons.get(status, "  ○  ")
         self._queue_list.configure(state="normal")
@@ -2016,6 +2409,8 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         self._queue_list.configure(state="disabled")
         self._queue_count_lbl.config(text="")
         self._queue_map = {}
+        self._queue_total = 0
+        self._queue_line_counter = 0
 
     # ══════════════════════════════════════════
     #  WINDOWS NOTIFICATION
@@ -2082,24 +2477,23 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         except Exception:
             json_data = {}
 
-        # Costruisci struttura: usa il JSON come fonte primaria,
-        # integra con scan disco per file non tracciati
-        for folder_key, songs in json_data.items():
-            if os.path.exists(folder_key):
-                all_data[folder_key] = list(songs)
-
-        # Scan disco per file non nel JSON
+        # Costruisci struttura: scan disco come fonte primaria (i file audio reali)
+        # Il JSON può contenere URL o nomi canzone — usiamo solo i file fisici
         for root_dir, dirs, files in os.walk(base_dir):
             audio_files = [f for f in files if os.path.splitext(f)[1].lower() in audio_exts]
             if not audio_files:
                 continue
-            if root_dir not in all_data:
-                all_data[root_dir] = []
-            existing_in_json = set(all_data[root_dir])
-            for f in audio_files:
-                stem = os.path.splitext(f)[0]
-                if stem not in existing_in_json:
-                    all_data[root_dir].append(f"📁 {stem}")
+            stems = [os.path.splitext(f)[0] for f in audio_files]
+            all_data[root_dir] = stems
+
+        # Se una cartella è nel JSON ma non ha file audio ancora (download parziale),
+        # mostrala comunque con i nomi dal JSON, filtrando gli URL
+        for folder_key, songs in json_data.items():
+            if folder_key not in all_data and os.path.exists(folder_key):
+                # Filtra le voci che sembrano URL
+                real_names = [s for s in songs if not s.startswith("http")]
+                if real_names:
+                    all_data[folder_key] = real_names
 
         if not all_data:
             messagebox.showinfo("Songs", "No downloaded songs found.")
@@ -2303,6 +2697,11 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         self._dl_btn.config(state="normal")
         self._stop_btn.config(state="disabled")
         self._track_lbl.config(text="")
+        # Se stoppato manualmente, svuota i pending e chiudi la sessione
+        if not self._running:
+            self._pending_batches.clear()
+            self._queue_session_active = False
+            self._downloaded_urls.clear()
 
 
 # ──────────────────────────────────────────────
