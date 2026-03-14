@@ -20,7 +20,6 @@ Download the latest installer from [Releases](link) and run it.
 1. Build the exe: `pyinstaller --onefile --noconsole Pythofy.py`
 2. Download `yt-dlp.exe` and place it in `dist/pythofy_tools/`
 3. Download `ffmpeg.exe` and place it in `dist/pythofy_tools/`
-4. Compile the setup with NSIS: right click `PythofySetup.nsi` → Compile
 
 ## License
 MIT
