@@ -42,6 +42,32 @@ def _find_cmd(name: str) -> list:
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def _is_admin():
+    """True se il processo ha già privilegi di amministratore."""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def _relaunch_as_admin(extra_args):
+    """Rilancia l'exe corrente come amministratore con ShellExecute runas."""
+    import ctypes, sys
+    frozen = getattr(sys, "frozen", False)
+    exe = sys.executable
+    if frozen:
+        params = " ".join(extra_args)
+    else:
+        script = os.path.abspath(__file__)
+        params = f'"{script}" ' + " ".join(extra_args)
+    try:
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return int(ret) > 32
+    except Exception:
+        return False
+
+
 # ──────────────────────────────────────────────────────────────
 #  PALETTE  —  terminal-luxe: near-black + acid green + zinc
 # ──────────────────────────────────────────────────────────────
@@ -64,7 +90,7 @@ BORDER    = "#222222"   # default border
 MONO      = "Arial"
 SANS      = "Arial"
 
-APP_VERSION  = "1.5.0"
+APP_VERSION  = "1.6.0"
 GITHUB_REPO  = "goldyreal/PythofyDownloader"
 
 
@@ -104,12 +130,20 @@ class YouTubeDownloaderApp(tk.Tk):
         self.minsize(1080, 580)
         self.geometry("1080x680")
 
-        self._process = None
+        self._process = None          # compatibilità (usato da _stop_download legacy)
+        self._active_procs = []        # lista processi paralleli attivi
+        self._active_procs_lock = threading.Lock()
+        self._active_downloads = {}    # proc -> set di filepath (raw + converted)
+        self._active_downloads_lock = threading.Lock()
+        self._dl_semaphore = threading.Semaphore(3)  # max 3 download in parallelo
+        self._active_workers = 0       # worker attivi (protetto da _idx_lock)
+        self._idx_lock = threading.Lock()
         self._running = False
         self._pending_batches = []   # lista di (url, out, quality, csv_songs, fmt)
         self._downloaded_urls = set()  # URL già scaricati o in coda (deduplicazione)
         self._queue_session_active = False  # True se la queue è "in uso"
         self._num_songs_var = tk.IntVar(value=100)
+        self._parallel_var = tk.IntVar(value=3)   # download paralleli
         self._csv_songs = None
         self._csv_file_name = None
         self._songs_list = []
@@ -247,12 +281,12 @@ class YouTubeDownloaderApp(tk.Tk):
         self._entry(dir_wrap, self._dir_var).grid(row=0, column=0, sticky="ew", ipady=10)
         self._ghost_btn(dir_wrap, "BROWSE", self._browse_dir).grid(row=0, column=1, padx=(8, 0))
 
-        # OPTIONS
+        # OPTIONS — riga 1: Bitrate, Format, Track Limit
         self._section_label(inner, "Options").pack(anchor="w", pady=(22, 10), **pad)
-        opts = tk.Frame(inner, bg=BG)
-        opts.pack(fill="x", **pad)
+        opts1 = tk.Frame(inner, bg=BG)
+        opts1.pack(fill="x", **pad)
 
-        q_frame = tk.Frame(opts, bg=BG)
+        q_frame = tk.Frame(opts1, bg=BG)
         q_frame.pack(side="left", padx=(0, 32))
         self._micro_label(q_frame, "BITRATE (kbps)").pack(anchor="w", pady=(0, 6))
         self._qual_var = tk.StringVar(value="192")
@@ -261,7 +295,7 @@ class YouTubeDownloaderApp(tk.Tk):
                      state="readonly", style="app.TCombobox",
                      font=(SANS, 10), width=7).pack(anchor="w")
 
-        fmt_frame = tk.Frame(opts, bg=BG)
+        fmt_frame = tk.Frame(opts1, bg=BG)
         fmt_frame.pack(side="left", padx=(0, 32))
         self._micro_label(fmt_frame, "FORMAT").pack(anchor="w", pady=(0, 6))
         self._fmt_var = tk.StringVar(value="mp3")
@@ -270,11 +304,20 @@ class YouTubeDownloaderApp(tk.Tk):
                      state="readonly", style="app.TCombobox",
                      font=(SANS, 10), width=6).pack(anchor="w")
 
-        n_frame = tk.Frame(opts, bg=BG)
-        n_frame.pack(side="left")
+        n_frame = tk.Frame(opts1, bg=BG)
+        n_frame.pack(side="left", padx=(0, 32))
         self._micro_label(n_frame, "TRACK LIMIT").pack(anchor="w", pady=(0, 6))
         self._num_songs_var = tk.IntVar(value=100)
         tk.Spinbox(n_frame, from_=1, to=100, textvariable=self._num_songs_var,
+                   font=(SANS, 10), bg=BG3, fg=TEXT,
+                   buttonbackground=BG4, relief="flat", bd=0,
+                   highlightthickness=1, highlightbackground=BG4,
+                   highlightcolor=ACCENT, width=5, wrap=False).pack(anchor="w", ipady=8)
+
+        p_frame = tk.Frame(opts1, bg=BG)
+        p_frame.pack(side="left")
+        self._micro_label(p_frame, "PARALLEL DL").pack(anchor="w", pady=(0, 6))
+        tk.Spinbox(p_frame, from_=1, to=20, textvariable=self._parallel_var,
                    font=(SANS, 10), bg=BG3, fg=TEXT,
                    buttonbackground=BG4, relief="flat", bd=0,
                    highlightthickness=1, highlightbackground=BG4,
@@ -1627,94 +1670,201 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             return None
 
     def _download_next_song(self, out, quality, fmt="mp3"):
-        """Download the next song in the list, skipping already downloaded ones"""
-        while self._current_song_idx < len(self._songs_list):
-            song = self._songs_list[self._current_song_idx]
-            if song in self._already_done:
+        """
+        Avvia fino a MAX_PARALLEL download contemporaneamente.
+        Chiamato all'inizio e ogni volta che un worker finisce.
+        """
+        MAX_PARALLEL = max(1, min(20, self._parallel_var.get()))
+
+        with self._idx_lock:
+            # Avvia worker finché ci sono slot liberi e canzoni da scaricare
+            while self._active_workers < MAX_PARALLEL and self._running:
+                # Salta le già scaricate
+                while self._current_song_idx < len(self._songs_list):
+                    song = self._songs_list[self._current_song_idx]
+                    if song in self._already_done:
+                        self._current_song_idx += 1
+                        n = self._current_song_idx
+                        self.after(0, lambda n=n, s=song: self._log_write(
+                            f"[{n}/{len(self._songs_list)}] Already downloaded", "dim"))
+                        self.after(0, lambda s=song: self._queue_set_status(s, "skipped"))
+                    else:
+                        break
+
+                if self._current_song_idx >= len(self._songs_list):
+                    break  # niente più canzoni da avviare
+
+                song = self._songs_list[self._current_song_idx]
                 self._current_song_idx += 1
-                n = self._current_song_idx
-                self.after(0, lambda n=n, s=song: self._log_write(
-                    f"[{n}/{len(self._songs_list)}] Already downloaded", "dim"))
-                self.after(0, lambda s=song: self._queue_set_status(s, "skipped"))
-            else:
-                break
+                self._active_workers += 1
+                idx = self._current_song_idx
+                # Avvia il worker in un thread separato
+                threading.Thread(
+                    target=self._worker,
+                    args=(song, idx, out, quality, fmt),
+                    daemon=True
+                ).start()
 
-        if not self._running or self._current_song_idx >= len(self._songs_list):
-            if self._running:
-                total = len(self._songs_list)
-                self.after(0, lambda: self._log_write(
-                    f"✓ Complete! ({total} songs)", "ok"))
-                # Controlla se ci sono batch in coda
-                if self._pending_batches:
-                    next_url, next_out, next_quality, next_csv, next_fmt = self._pending_batches.pop(0)
-                    self.after(0, lambda u=next_url: self._log_write(f"▶ Starting queued batch: {u}", "bold"))
-                    threading.Thread(
-                        target=self._extract_and_download,
-                        args=(next_url, next_out, next_quality, next_csv, next_fmt),
-                        daemon=True
-                    ).start()
-                    return  # non chiamare _on_done, stiamo continuando
-                else:
-                    self.after(0, lambda: self._set_status("Complete", ACCENT))
-                    self._notify_complete(total)
-                    self._queue_session_active = False  # sessione finita, prossimo click fa reset
-            self._running = False
-            self.after(0, self._on_done)
+    def _worker(self, song, idx, out, quality, fmt):
+        """Esegue il download di una singola canzone e poi chiama _on_worker_done."""
+        if not self._running:
+            with self._idx_lock:
+                self._active_workers -= 1
             return
-
-        song = self._songs_list[self._current_song_idx]
-        self._current_song_idx += 1
-        idx = self._current_song_idx
+        is_youtube_mode    = getattr(self, "_is_youtube_mode", False)
+        is_soundcloud_mode = getattr(self, "_is_soundcloud_mode", False)
+        total = len(self._songs_list)
 
         display_title = song
-        is_youtube_mode = getattr(self, "_is_youtube_mode", False)
-        is_soundcloud_mode = getattr(self, "_is_soundcloud_mode", False)
         if is_youtube_mode and ("youtube.com" in song or "youtu.be" in song):
             title = self._get_youtube_video_title(song)
             if title:
                 display_title = title
 
         self.after(0, lambda: self._log_write(
-            f"[{idx}/{len(self._songs_list)}] - {display_title}", "bold"))
+            f"[{idx}/{total}] - {display_title}", "bold"))
         self.after(0, lambda s=song: self._queue_set_status(s, "downloading"))
+        self.after(0, lambda t=display_title: self._track_lbl.config(
+            text=f"⏳ [{idx}/{total}] {t}  -  downloading"))
 
-        if is_youtube_mode and ("youtube.com" in song or "youtu.be" in song):
-            self.after(0, lambda t=display_title: self._track_lbl.config(
-                text=f"⏳ [{idx}/{len(self._songs_list)}] {t}  -  downloading"))
-        elif is_soundcloud_mode:
-            self.after(0, lambda t=display_title: self._track_lbl.config(
-                text=f"⏳ [{idx}/{len(self._songs_list)}] {t}  -  downloading"))
-        else:
-            self.after(0, lambda t=display_title: self._track_lbl.config(
-                text=f"⏳ [{idx}/{len(self._songs_list)}] {t}  -  searching..."))
+        retries = 0
+        success = False
+        while retries <= self._max_retries:
+            if not self._running:
+                break
+            done_event = threading.Event()
+            result = [False]
+            result_file = [None]
 
-        def on_complete(success):
+            def on_complete(ok, fpath=None, _ev=done_event, _res=result, _rf=result_file):
+                _res[0] = ok
+                _rf[0] = fpath
+                _ev.set()
+
+            self._download_song_youtube(song, out, quality, on_complete, fmt, track_num=idx)
+            done_event.wait()
+            success = result[0]
+
             if success:
-                self._already_done.add(song)
-                self._save_done(self._done_file, self._already_done, self._done_key)
-                self.after(0, lambda: self._log_write(f"   ✓ Done", "ok"))
-                self.after(0, lambda s=song: self._queue_set_status(s, "done"))
-                self._retry_count.pop(song, None)
-                self._download_next_song(out, quality, fmt)
+                break
+            retries += 1
+            if retries <= self._max_retries:
+                self.after(0, lambda c=retries, m=self._max_retries:
+                    self._log_write(f"   Retry ({c}/{m})...", "warn"))
+                import time; time.sleep(1)
             else:
-                current_retry = self._retry_count.get(song, 0)
-                if current_retry < self._max_retries:
-                    self._retry_count[song] = current_retry + 1
-                    self.after(0, lambda c=current_retry+1, m=self._max_retries:
-                        self._log_write(f"   Retry ({c}/{m})...", "warn"))
-                    def retry_download():
-                        import time
-                        time.sleep(1)
-                        if self._running:
-                            self._download_song_youtube(song, out, quality, on_complete, fmt)
-                    threading.Thread(target=retry_download, daemon=True).start()
-                else:
-                    self.after(0, lambda: self._log_write(f"   Skipped after {self._max_retries} retries", "err"))
-                    self.after(0, lambda s=song: self._queue_set_status(s, "error"))
-                    self._retry_count.pop(song, None)
-                    self._download_next_song(out, quality, fmt)
+                self.after(0, lambda: self._log_write(
+                    f"   Skipped after {self._max_retries} retries", "err"))
 
-        self._download_song_youtube(song, out, quality, on_complete, fmt)
+        self._on_worker_done(song, success, out, quality, fmt, track_num=idx, output_file=result_file[0])
+
+    def _write_track_number_to_untagged(self, out, track_num):
+        """Fallback: trova il file audio senza track number e scrivilo."""
+        audio_exts = {".mp3", ".flac", ".m4a", ".ogg", ".opus"}
+        try:
+            from mutagen.id3 import ID3
+            from mutagen.mp4 import MP4
+            from mutagen.flac import FLAC
+            from mutagen.oggvorbis import OggVorbis
+            for f in os.listdir(out):
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in audio_exts:
+                    continue
+                fpath = os.path.join(out, f)
+                try:
+                    has_track = False
+                    if ext == ".mp3":
+                        tags = ID3(fpath)
+                        has_track = "TRCK" in tags and str(tags["TRCK"]).strip() not in ("", "0")
+                    elif ext == ".flac":
+                        tags = FLAC(fpath)
+                        has_track = bool(tags.get("tracknumber"))
+                    elif ext == ".m4a":
+                        tags = MP4(fpath)
+                        has_track = bool(tags.get("trkn"))
+                    elif ext in (".ogg", ".opus"):
+                        tags = OggVorbis(fpath)
+                        has_track = bool(tags.get("tracknumber"))
+                    if not has_track:
+                        self._write_track_number_to_file(fpath, track_num)
+                        return  # scrivi solo sul primo file senza numero
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _write_track_number_to_file(self, fpath, track_num):
+        """Scrive il track number in un file audio specifico usando mutagen."""
+        try:
+            from mutagen.id3 import ID3, TRCK
+            from mutagen.mp4 import MP4
+            from mutagen.flac import FLAC
+            from mutagen.oggvorbis import OggVorbis
+            ext = os.path.splitext(fpath)[1].lower()
+            if ext == ".mp3":
+                tags = ID3(fpath)
+                tags["TRCK"] = TRCK(encoding=3, text=str(track_num))
+                tags.save(fpath)
+            elif ext == ".flac":
+                tags = FLAC(fpath)
+                tags["tracknumber"] = [str(track_num)]
+                tags.save()
+            elif ext == ".m4a":
+                tags = MP4(fpath)
+                tags["trkn"] = [(track_num, 0)]
+                tags.save()
+            elif ext in (".ogg", ".opus"):
+                tags = OggVorbis(fpath)
+                tags["tracknumber"] = [str(track_num)]
+                tags.save()
+        except Exception:
+            pass
+
+    def _on_worker_done(self, song, success, out, quality, fmt, track_num=None, output_file=None):
+        """Chiamato quando un worker finisce — aggiorna stato e avvia il prossimo."""
+        if success:
+            with self._idx_lock:
+                self._already_done.add(song)
+            self._save_done(self._done_file, self._already_done, self._done_key)
+            self.after(0, lambda: self._log_write("   ✓ Done", "ok"))
+            self.after(0, lambda s=song: self._queue_set_status(s, "done"))
+            self._retry_count.pop(song, None)
+        else:
+            self.after(0, lambda s=song: self._queue_set_status(s, "error"))
+            self._retry_count.pop(song, None)
+
+        with self._idx_lock:
+            self._active_workers -= 1
+            all_started  = self._current_song_idx >= len(self._songs_list)
+            still_active = self._active_workers
+            running      = self._running
+
+        # Prova ad avviare il prossimo slot
+        if running:
+            self._download_next_song(out, quality, fmt)
+
+        # Controlla se siamo davvero finiti (tutti avviati + nessun worker attivo)
+        with self._idx_lock:
+            finished = (self._current_song_idx >= len(self._songs_list)
+                        and self._active_workers == 0)
+
+        if finished and self._running:
+            total = len(self._songs_list)
+            self.after(0, lambda: self._log_write(f"✓ Complete! ({total} songs)", "ok"))
+            if self._pending_batches:
+                next_url, next_out, next_quality, next_csv, next_fmt = self._pending_batches.pop(0)
+                self.after(0, lambda u=next_url: self._log_write(f"▶ Starting queued batch: {u}", "bold"))
+                threading.Thread(
+                    target=self._extract_and_download,
+                    args=(next_url, next_out, next_quality, next_csv, next_fmt),
+                    daemon=True
+                ).start()
+            else:
+                self.after(0, lambda: self._set_status("Complete", ACCENT))
+                self._notify_complete(total)
+                self._queue_session_active = False
+                self._running = False
+                self.after(0, self._on_done)
 
     def _run_ytdlp(self, song, out, quality):
         # Comando yt-dlp per cercare e scaricare da YouTube
@@ -1730,6 +1880,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             "--add-metadata",
             "--parse-metadata", "title:%(artist)s - %(title)s",
             "--parse-metadata", r"%(title)s:(?P<title>.+?)(?:\s*[\(\[].+?[\)\]])*\s*$",
+            "--print", "after_move:PYTHOFY_OUTFILE:%(filepath)s",
         ]
         
         try:
@@ -1766,7 +1917,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             self.after(0, lambda: self._log_write(f"❌ Error: {e}", "err"))
             self.after(0, lambda: self._set_status("Error", ERROR_CLR))
 
-    def _download_song_youtube(self, song, out, quality, on_complete, fmt="mp3"):
+    def _download_song_youtube(self, song, out, quality, on_complete, fmt="mp3", track_num=None):
         """Download a single song from YouTube (batch version)"""
         import time
         import threading
@@ -1794,17 +1945,18 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             "-f", "bestaudio",
             "--audio-format", fmt,
         ] + audio_quality_args + [
-            # Nome file: "Artista - Titolo" se l'artista è disponibile, altrimenti solo titolo
             "-o", os.path.join(out, "%(artist,uploader)s - %(title)s.%(ext)s"),
             "--no-warnings",
             "--embed-metadata",
             "--add-metadata",
             "--parse-metadata", "title:%(artist)s - %(title)s",
             "--parse-metadata", r"%(title)s:(?P<title>.+?)(?:\s*[\(\[].+?[\)\]])*\s*$",
-        ]
+        ] + ([
+            "--postprocessor-args", f"ffmpeg:-metadata track={track_num}",
+        ] if track_num else [])
 
         try:
-            self._process = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1813,20 +1965,26 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
+            self._process = proc  # compatibilità
+            with self._active_procs_lock:
+                self._active_procs.append(proc)
+            with self._active_downloads_lock:
+                self._active_downloads[proc] = set()
 
             last_heartbeat = time.time()
             phase = search_type
             process_completed = False
 
-            # Funzione per leggere l'output con timeout
+            output_file = [None]
+
             def read_output():
                 nonlocal process_completed, last_heartbeat, phase
                 last_progress = 0
                 progress_logged = False
                 try:
-                    for line in self._process.stdout:
+                    for line in proc.stdout:
                         if not self._running:
-                            self._process.terminate()
+                            proc.terminate()
                             break
 
                         line = line.rstrip()
@@ -1837,6 +1995,25 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                         
                         # Only log important lines, filter out noise
                         should_log = False
+                        if "pythofy_outfile:" in l:
+                            # Path finale del file — sempre presente grazie a --print after_move
+                            try:
+                                fpath = line.split("PYTHOFY_OUTFILE:", 1)[1].strip()
+                                output_file[0] = fpath
+                                with self._active_downloads_lock:
+                                    if proc in self._active_downloads:
+                                        self._active_downloads[proc].add(fpath)
+                            except Exception:
+                                pass
+                            continue  # non loggare questa riga
+                        if "[download] destination:" in l:
+                            try:
+                                fpath = line.split("Destination:", 1)[1].strip()
+                                with self._active_downloads_lock:
+                                    if proc in self._active_downloads:
+                                        self._active_downloads[proc].add(fpath)
+                            except Exception:
+                                pass
                         if "[youtube]" in l and "extracting" in l:
                             # Don't log raw output, show simplified message
                             phase = "extracting"
@@ -1863,8 +2040,16 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                             tag = self._classify_line(line)
                             self.after(0, lambda l=line, t=tag: self._log_write(f"   {l}", t))
                             
-                            # Add status message for finalization phase
+                            # Cattura il path esatto del file creato
                             if "[extractaudio]" in l and "destination" in l:
+                                try:
+                                    fpath = line.split("Destination:", 1)[1].strip()
+                                    output_file[0] = fpath
+                                    with self._active_downloads_lock:
+                                        if proc in self._active_downloads:
+                                            self._active_downloads[proc].add(fpath)
+                                except Exception:
+                                    pass
                                 self.after(0, lambda: self._log_write(f"   Adding metadata & thumbnails...", "dim"))
 
                         now = time.time()
@@ -1887,28 +2072,37 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
             reader_thread.start()
 
             # Wait for process with timeout (3 min per canzone)
-            self._process.wait(timeout=180)
-            rc = self._process.returncode
+            proc.wait(timeout=180)
+            rc = proc.returncode
+            with self._active_procs_lock:
+                try:
+                    self._active_procs.remove(proc)
+                except ValueError:
+                    pass
+            with self._active_downloads_lock:
+                self._active_downloads.pop(proc, None)
 
             # Wait for reader to finish
             reader_thread.join(timeout=5)
 
             if self._running:
-                on_complete(rc == 0)
+                on_complete(rc == 0, output_file[0])
         except subprocess.TimeoutExpired:
-            # Timeout: termina il processo
             try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
+                proc.terminate()
+                proc.wait(timeout=5)
             except:
                 try:
-                    self._process.kill()
+                    proc.kill()
                 except:
                     pass
+            with self._active_procs_lock:
+                try: self._active_procs.remove(proc)
+                except ValueError: pass
             if self._running:
                 self.after(0, lambda: self._log_write(
                     f"⚠ Download timeout (> 3 min), saltato", "warn"))
-                on_complete(False)
+                on_complete(False, None)
         except Exception as e:
             # Assicurati che il processo sia terminato
             try:
@@ -1917,11 +2111,14 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
                     self._process.wait(timeout=5)
             except:
                 pass
+            with self._active_procs_lock:
+                try: self._active_procs.remove(proc)
+                except (ValueError, UnboundLocalError): pass
             if self._running:
                 error_msg = str(e)[:80]
                 self.after(0, lambda m=error_msg: self._log_write(
                     f"⚠ Errore nel download: {m}", "warn"))
-                on_complete(False)
+                on_complete(False, None)
 
     def _classify_line(self, line):
         l = line.lower()
@@ -1955,10 +2152,76 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
 
     def _stop_download(self):
         self._running = False
+
+        # Raccogli i filepath PRIMA di terminare i processi
+        with self._active_downloads_lock:
+            partial_sets = list(self._active_downloads.values())
+            self._active_downloads.clear()
+
+        # Termina tutti i processi paralleli attivi
+        with self._active_procs_lock:
+            for proc in self._active_procs:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                except Exception:
+                    pass
+            self._active_procs.clear()
+
+        # Compatibilità con _process singolo
         if self._process and self._process.poll() is None:
-            self._process.terminate()
-            self._log_write("Download stopped", "warn")
-            self._set_status("Stopped", WARN_CLR)
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+
+        # Piccola pausa per dare ai processi il tempo di chiudersi
+        import time as _time
+        _time.sleep(0.5)
+
+        # Cancella tutti i file parziali tracciati
+        deleted = 0
+        all_partial = set()
+        for fset in partial_sets:
+            if fset:
+                all_partial.update(fset)
+
+        for fpath in all_partial:
+            if not fpath:
+                continue
+            # Cancella il file principale
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                    deleted += 1
+                except Exception:
+                    pass
+            # Cancella anche file .part/.ytdl/.temp associati
+            for ext in (".part", ".ytdl", ".temp"):
+                if os.path.exists(fpath + ext):
+                    try:
+                        os.remove(fpath + ext)
+                        deleted += 1
+                    except Exception:
+                        pass
+
+        # Cerca anche file .part/.ytdl nella cartella di output (fallback)
+        try:
+            out_dir = self._done_key if hasattr(self, "_done_key") else None
+            if out_dir and os.path.isdir(out_dir):
+                for f in os.listdir(out_dir):
+                    if f.endswith(".part") or f.endswith(".ytdl"):
+                        try:
+                            os.remove(os.path.join(out_dir, f))
+                            deleted += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        msg = f"Download stopped — {deleted} partial file(s) removed" if deleted else "Download stopped"
+        self._log_write(msg, "warn")
+        self._set_status("Stopped", WARN_CLR)
         self._on_done()
 
     # ══════════════════════════════════════════
@@ -2060,6 +2323,22 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
     def _do_update(self, assets, win):
         import urllib.request, ssl, os, sys, tempfile, shutil, zipfile
 
+        # Se non siamo admin, rilancia come admin e chiudi questa finestra
+        if not _is_admin():
+            import json as _json
+            tmp_assets = tempfile.mktemp(prefix="pythofy_assets_", suffix=".json")
+            with open(tmp_assets, "w") as f:
+                _json.dump(assets, f)
+            ok = _relaunch_as_admin([f"--do-update={tmp_assets}"])
+            if ok:
+                self.after(0, win.destroy)
+                self.after(200, self.destroy)
+                import sys as _sys; _sys.exit(0)
+            else:
+                self.after(0, lambda: self._update_progress_var.set(
+                    "❌ Admin privileges required — please run as administrator"))
+            return
+
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -2073,7 +2352,7 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         url = assets.get(ASSET_NAME)
         if not url:
             self.after(0, lambda: self._update_progress_var.set(
-                f"❌ Asset \"{ASSET_NAME}\" not found in release"))
+                f'❌ Asset "{ASSET_NAME}" not found in release'))
             return
 
         tmp_dir = tempfile.mkdtemp(prefix="pythofy_update_")
@@ -2213,11 +2492,21 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
         if not os.path.exists(old_path):
             self._log_write("❌ Previous version file not found", "err")
             return
+
+        # Se non siamo admin, rilancia come admin
+        if not _is_admin():
+            ok = _relaunch_as_admin(["--do-rollback"])
+            if ok:
+                self.after(200, self.destroy)
+                import sys as _sys; _sys.exit(0)
+            else:
+                self._log_write("❌ Admin privileges required — please run as administrator", "err")
+            return
+
         base = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
         current = os.path.join(base, "Pythofy.exe")
         broken  = current + ".broken"
         try:
-            # Sposta il corrente in .broken, rimetti il .old al suo posto
             if frozen:
                 try:
                     os.replace(current, broken)
@@ -2707,8 +2996,128 @@ Click "DOWNLOAD" and Pythofy will download all songs from your playlist"""
 # ──────────────────────────────────────────────
 #  Entry point
 # ──────────────────────────────────────────────
+def _handle_cli_admin_actions():
+    import sys, os, shutil
+    args = sys.argv[1:]
+    if not args:
+        return False
+
+    for arg in args:
+        if arg.startswith("--do-update="):
+            import json as _json, tempfile, zipfile, urllib.request, ssl, threading as _th
+            import tkinter as tk
+            assets_file = arg.split("=", 1)[1]
+            try:
+                with open(assets_file, "r") as f:
+                    assets = _json.load(f)
+                os.remove(assets_file)
+            except Exception:
+                return True
+
+            root = tk.Tk()
+            root.title("Pythofy — Updating…")
+            root.geometry("420x70")
+            root.configure(bg="#0d0d0d")
+            root.resizable(False, False)
+            progress_var = tk.StringVar(value="Starting update…")
+            tk.Label(root, textvariable=progress_var, font=("Arial", 10),
+                     bg="#0d0d0d", fg="#a3e635").pack(expand=True)
+
+            def run_update():
+                frozen = getattr(sys, "frozen", False)
+                base_path = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
+                tools_path = os.path.join(base_path, "pythofy_tools")
+                ASSET_NAME = "Pythofy.-.Portable.zip"
+                url = assets.get(ASSET_NAME)
+                if not url:
+                    root.after(0, lambda: progress_var.set("❌ Asset not found"))
+                    root.after(2000, root.destroy)
+                    return
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                tmp_dir = tempfile.mkdtemp(prefix="pythofy_update_")
+                zip_path = os.path.join(tmp_dir, "update.zip")
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "Pythofy-Updater"})
+                    with urllib.request.urlopen(req, timeout=180, context=ctx) as resp:
+                        total = int(resp.headers.get("Content-Length", 0))
+                        done = 0
+                        with open(zip_path, "wb") as fp:
+                            while True:
+                                buf = resp.read(65536)
+                                if not buf: break
+                                fp.write(buf)
+                                done += len(buf)
+                                if total:
+                                    pct = int(done / total * 100)
+                                    root.after(0, lambda p=pct: progress_var.set(f"Downloading… {p}%"))
+                    root.after(0, lambda: progress_var.set("Extracting…"))
+                    extract_dir = os.path.join(tmp_dir, "extracted")
+                    with zipfile.ZipFile(zip_path, "r") as z:
+                        z.extractall(extract_dir)
+                    src_root = extract_dir
+                    for entry in os.listdir(extract_dir):
+                        candidate = os.path.join(extract_dir, entry)
+                        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "Pythofy.exe")):
+                            src_root = candidate
+                            break
+                    os.makedirs(tools_path, exist_ok=True)
+                    for tool in ("yt-dlp.exe", "ffmpeg.exe"):
+                        src = os.path.join(src_root, "pythofy_tools", tool)
+                        if os.path.exists(src):
+                            root.after(0, lambda t=tool: progress_var.set(f"Installing {t}…"))
+                            shutil.copy2(src, os.path.join(tools_path, tool))
+                    new_exe_src = os.path.join(src_root, "Pythofy.exe")
+                    new_exe_dst = os.path.join(base_path, "Pythofy.exe")
+                    if os.path.exists(new_exe_src):
+                        root.after(0, lambda: progress_var.set("Installing Pythofy.exe…"))
+                        if frozen:
+                            try: os.replace(new_exe_dst, new_exe_dst + ".old")
+                            except: pass
+                        shutil.copy2(new_exe_src, new_exe_dst)
+                    root.after(0, lambda: progress_var.set("✓ Done — restarting…"))
+                    import subprocess as _sp
+                    root.after(1200, lambda dst=new_exe_dst: (
+                        _sp.Popen([dst], creationflags=0x08000000),
+                        root.destroy()
+                    ))
+                except Exception as e:
+                    root.after(0, lambda err=str(e)[:80]: progress_var.set(f"❌ {err}"))
+                    root.after(3000, root.destroy)
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            _th.Thread(target=run_update, daemon=True).start()
+            root.mainloop()
+            return True
+
+    if "--do-rollback" in args:
+        frozen = getattr(sys, "frozen", False)
+        base = os.path.dirname(sys.executable) if frozen else os.path.dirname(__file__)
+        old_path = os.path.join(base, "Pythofy.exe.old")
+        current  = os.path.join(base, "Pythofy.exe")
+        if not os.path.exists(old_path):
+            return True
+        try:
+            if frozen:
+                try: os.replace(current, current + ".broken")
+                except: pass
+            shutil.copy2(old_path, current)
+            os.remove(old_path)
+            import subprocess as _sp
+            _sp.Popen([current], creationflags=0x08000000)
+        except Exception:
+            pass
+        return True
+
+    return False
+
+
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
+    if _handle_cli_admin_actions():
+        import sys; sys.exit(0)
     app = YouTubeDownloaderApp()
     app.mainloop()
